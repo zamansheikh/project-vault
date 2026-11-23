@@ -100,6 +100,7 @@ fi
 if [[ -f "$VAULT/.state/ui.json" ]]; then
   pid=$(sed -n 's/.*"pid": *\([0-9]*\).*/\1/p' "$VAULT/.state/ui.json")
   [[ -n $pid ]] && kill "$pid" 2>/dev/null && info "closed the open Project Vault window (open it again after this)"
+  rm -f "$VAULT/.state/ui.json"
 fi
 
 # ---------- program files ----------

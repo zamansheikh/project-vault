@@ -107,6 +107,21 @@ for i in 1 2; do sleep 1; vault offsite >/dev/null; done
 dmg=( "$T"/offsite/ProjectVault-*.dmg(N) ); enc=( "$T"/offsite/ProjectVault-*.tar.gz.enc(N) )
 check "only KEEP=2 copies of each kind are kept"  test ${#dmg} -eq 2 -a ${#enc} -eq 2
 
+# Recover: lose part of the vault, then bring it back from an encrypted copy.
+rm -rf "$VA/history/acme/shop-app"; rm -f "$VA/current/acme/shop-app/android/key.properties"
+echo 'API_KEY=vault-differs' > "$VA/current/acme/shop-app/.env"
+vault recover "${enc[1]}" >/dev/null
+check "recover brings back a missing file"        test -f "$VA/current/acme/shop-app/android/key.properties"
+check "recover brings back older versions"        zsh -c "ls -A '$VA/history/acme/shop-app/' | grep -q '^\.env\.v1_'"
+check "recover keeps the copy's differing file"   zsh -c "ls -A '$VA/history/acme/shop-app/' | grep -q '^\.env\.recovered_'"
+check "recover never throws away the vault's copy" zsh -c "grep -rqx 'API_KEY=vault-differs' '$VA/current' '$VA/history'"
+
+# Cloud folder set up and removed without questions (as the window does it).
+vault offsite remove >/dev/null
+check "offsite remove turns cloud copies off"     zsh -c "! grep -q '^DEST=' '$VA/offsite.conf'"
+mkdir -p "$T/offsite2"; vault offsite setup "$T/offsite2" >/dev/null
+check "offsite setup <folder> needs no questions" zsh -c "ls '$T/offsite2' | grep -q '\.tar\.gz\.enc$'"
+
 # A USB drive: an ExFAT disk image mounted outside /Volumes stands in for one.
 hdiutil create -quiet -size 40m -fs ExFAT -volname PVSMOKE "$T/usb.dmg"
 mkdir -p "$T/usb"

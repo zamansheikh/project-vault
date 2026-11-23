@@ -591,7 +591,16 @@ def api_offsite(body):
 def api_restore(body):
     version = body.get("version")
     project = body.get("project")
-    if project is not None:
+    if body.get("paths") is not None:
+        targets = []
+        for p in body.get("paths") or []:
+            rel = clean_rel(p)
+            if not rel or not os.path.isfile(inside(CUR, rel)):
+                raise ApiError(404, "Not in the vault: %s" % rel)
+            targets.append(rel)
+        if not targets:
+            raise ApiError(400, "Nothing selected.")
+    elif project is not None:
         files = project_files(project)
         if not files:
             raise ApiError(404, "No project called %s in the vault" % project)
@@ -692,6 +701,15 @@ def api_open(body):
         while not os.path.exists(full) and full != base:
             full = os.path.dirname(full)
         subprocess.Popen(["open", "-R", full] if os.path.isfile(full) else ["open", full])
+    elif what in ("cloud", "usb"):
+        b = backups_state(with_copies=False)
+        d = b["cloud"].get("dir") if what == "cloud" else b["usb"].get("dir")
+        if not d or not os.path.isdir(d):
+            raise ApiError(404, "That folder is not available right now.")
+        subprocess.Popen(["open", d])
+    elif what == "log":
+        log = os.path.join(HOME, "Library", "Logs", "ProjectVault", "agent.log")
+        subprocess.Popen(["open", "-R", log] if os.path.exists(log) else ["open", os.path.dirname(log)])
     else:
         raise ApiError(400, "Unknown target")
     return {"ok": True}
@@ -702,9 +720,258 @@ def api_quit(body):
     return {"ok": True}
 
 
+# ---------- backups: background job, password, cloud folder, USB drive ----------
+
+KC_SERVICE = os.environ.get("VAULT_KC_SERVICE") or "Project Vault backup"
+TEST_KEYCHAIN = os.environ.get("VAULT_KEYCHAIN")   # used by tests instead of the login keychain
+ICLOUD = os.path.join(HOME, "Library", "Mobile Documents", "com~apple~CloudDocs")
+USB_DIR = "ProjectVault Backups"
+COPY_RE = re.compile(r"^ProjectVault-(\d{4}-\d\d-\d\d)_(\d\d)(\d\d)(\d\d)?\.(dmg|tar\.gz\.enc)$")
+
+
+def offsite_settings():
+    conf, out = os.path.join(VAULT, "offsite.conf"), {}
+    if os.path.exists(conf):
+        with open(conf, encoding="utf-8", errors="replace") as f:
+            for line in f:
+                if "=" in line:
+                    k, v = line.rstrip("\n").split("=", 1)
+                    out[k] = v
+    return out
+
+
+def have_password():
+    try:
+        return subprocess.run(["security", "find-generic-password", "-s", KC_SERVICE, "-a", os.environ.get("USER", "")]
+                              + ([TEST_KEYCHAIN] if TEST_KEYCHAIN else []), capture_output=True, timeout=10).returncode == 0
+    except Exception:
+        return False
+
+
+def agent_disabled():
+    try:
+        out = subprocess.run(["launchctl", "print-disabled", "gui/%d" % os.getuid()],
+                             capture_output=True, text=True, timeout=5).stdout
+        return '"%s" => disabled' % AGENT_LABEL in out
+    except Exception:
+        return False
+
+
+def list_copies(d, limit=12):
+    """Copies in a destination folder, newest first: one entry per date with its formats."""
+    if not os.path.isdir(d):
+        return []
+    try:
+        names = os.listdir(d)
+    except OSError:
+        return None
+    groups = {}
+    for n in names:
+        m = COPY_RE.match(n)
+        if not m:
+            continue
+        base = n[: -len(m.group(5)) - 1]
+        g = groups.setdefault(base, {"name": base, "at": "%s %s:%s" % (m.group(1), m.group(2), m.group(3)),
+                                     "formats": [], "files": [], "size": 0, "dir": d})
+        g["files"].append(n)
+        g["formats"].append("Mac" if m.group(5) == "dmg" else "Windows/Linux")
+        try:
+            g["size"] += os.path.getsize(os.path.join(d, n))
+        except OSError:
+            pass
+    for g in groups.values():
+        g["formats"].sort()
+    return sorted(groups.values(), key=lambda g: g["name"], reverse=True)[:limit]
+
+
+def drive_info(target):
+    import plistlib
+    try:
+        out = subprocess.run(["diskutil", "info", "-plist", target], capture_output=True, timeout=20).stdout
+        return plistlib.loads(out) if out else {}
+    except Exception:
+        return {}
+
+
+FS_NOTES = {
+    "exfat": ("ExFAT", "Opens on Mac and Windows", "ok"),
+    "msdos": ("FAT32", "Opens on Mac and Windows", "ok"),
+    "apfs": ("APFS", "Mac only: Windows cannot read this drive", "warn"),
+    "hfs": ("Mac OS Extended", "Mac only: Windows cannot read this drive", "warn"),
+    "ntfs": ("NTFS", "macOS cannot write to NTFS drives", "bad"),
+}
+
+
+def describe_drive(info, mp):
+    fs = (info.get("FilesystemType") or "").lower()
+    label, note, level = FS_NOTES.get(fs, (fs.upper() or "Unknown format", "Mac only", "warn"))
+    return {"mount": mp, "name": info.get("VolumeName") or os.path.basename(mp), "uuid": info.get("VolumeUUID", ""),
+            "format": label, "note": note, "level": level,
+            "free": info.get("FreeSpace") or info.get("APFSContainerFree") or 0,
+            "total": info.get("TotalSize") or info.get("Size") or 0,
+            "writable": bool(info.get("WritableVolume")) and os.access(mp, os.W_OK)}
+
+
+def list_drives():
+    drives = []
+    for name in sorted(os.listdir("/Volumes")):
+        mp = os.path.join("/Volumes", name)
+        if not os.path.ismount(mp):
+            continue
+        info = drive_info(mp)
+        if info.get("Internal", True) or info.get("BusProtocol") == "Disk Image" or not info.get("VolumeUUID"):
+            continue
+        drives.append(describe_drive(info, mp))
+    return drives
+
+
+def backups_state(with_copies=True):
+    s = offsite_settings()
+    agent = agent_status()
+    agent["disabled"] = agent_disabled()
+    out = {"agent": agent, "password": have_password(), "icloudAvailable": os.path.isdir(ICLOUD),
+           "lastSync": last_sync(), "cloud": {"configured": False}, "usb": {"configured": False}}
+    dest = (s.get("DEST") or "").strip()
+    if dest:
+        d = os.path.expanduser(dest)
+        out["cloud"] = {"configured": True, "dir": d,
+                        "where": ("iCloud Drive › " + os.path.basename(d)) if d.startswith(ICLOUD) else d.replace(HOME, "~", 1),
+                        "last": _last_copy("last-offsite"),
+                        "failing": os.path.exists(os.path.join(STATE, "attempt-cloud"))}
+        if with_copies:
+            out["cloud"]["copies"] = list_copies(d)
+    if s.get("USB_UUID"):
+        info = drive_info(s["USB_UUID"])
+        mp = info.get("MountPoint")
+        plugged = bool(mp and os.path.isdir(mp))
+        u = {"configured": True, "name": s.get("USB_NAME") or "USB drive", "plugged": plugged,
+             "last": _last_copy("last-usb"), "failing": os.path.exists(os.path.join(STATE, "attempt-usb"))}
+        if plugged:
+            u.update(describe_drive(info, mp))
+            u["name"] = s.get("USB_NAME") or u["name"]
+            u["dir"] = os.path.join(mp, USB_DIR)
+            if with_copies:
+                u["copies"] = list_copies(u["dir"])
+        out["usb"] = u
+    return out
+
+
+def api_backups(q):
+    return backups_state()
+
+
+def api_drives(q):
+    return {"drives": list_drives()}
+
+
+def api_missing(q):
+    idx = load_index()
+    out = []
+    for rel in vault_files():
+        if os.path.exists(os.path.join(ROOT, rel)):
+            continue
+        proj = project_of(rel, idx)
+        folder = os.path.join(ROOT, proj) if proj != ROOT_GROUP else ROOT
+        _vs, cur_v, _ = versions(rel)
+        out.append({"path": rel, "project": proj, "name": short_name(rel, proj), "version": cur_v,
+                    "projectExists": os.path.isdir(folder)})
+    return {"files": out}
+
+
+def api_usb_setup(body):
+    mount = body.get("mount") or ""
+    if not any(d["mount"] == mount for d in list_drives()):
+        raise ApiError(400, "That drive is not plugged in any more.")
+    return run_script(["usb", "setup", mount])
+
+
+def api_usb_now(body):
+    return run_script(["usb", "now"])
+
+
+def api_usb_remove(body):
+    return run_script(["usb", "remove"])
+
+
+def api_cloud_setup(body):
+    folder = body.get("folder") or ""
+    if folder != "icloud":
+        folder = os.path.abspath(os.path.expanduser(folder))
+        if not os.path.isdir(folder):
+            raise ApiError(400, "Folder not found: %s" % folder)
+        if folder == VAULT or folder.startswith(VAULT + os.sep):
+            raise ApiError(400, "Copies cannot go inside the vault itself.")
+    return run_script(["offsite", "setup", folder])
+
+
+def api_cloud_remove(body):
+    return run_script(["offsite", "remove"])
+
+
+def _choose(script):
+    try:
+        r = subprocess.run(["osascript", "-e", "activate", "-e", script], capture_output=True, text=True, timeout=600)
+    except subprocess.TimeoutExpired:
+        return {"cancelled": True}
+    path = r.stdout.strip()
+    return {"path": path} if r.returncode == 0 and path else {"cancelled": True}
+
+
+def api_choose_folder(body):
+    return _choose('POSIX path of (choose folder with prompt "Choose the folder for encrypted Project Vault copies")')
+
+
+def api_choose_copy(body):
+    return _choose('POSIX path of (choose file with prompt "Choose a Project Vault copy (.tar.gz.enc or .dmg)")')
+
+
+def api_service(body):
+    action = body.get("action")
+    if action not in ("start", "stop"):
+        raise ApiError(400, "Unknown action")
+    return run_script([action], timeout=300)
+
+
+def api_password(body):
+    pw, confirm = body.get("password") or "", body.get("confirm") or ""
+    if pw != confirm:
+        raise ApiError(400, "The two passwords are not the same.")
+    if len(pw) < 8:
+        raise ApiError(400, "Use at least 8 characters.")
+    if not all(32 <= ord(c) < 127 for c in pw):
+        raise ApiError(400, "Use only standard keyboard characters (A-Z, a-z, 0-9, spaces and symbols), so the "
+                            "password also works on Windows.")
+    def q(v):
+        return '"' + v.replace("\\", "\\\\").replace('"', '\\"') + '"'
+    user = os.environ.get("USER", "")
+    # The command goes to `security -i` on stdin, so the password is never on a command line.
+    cmd = "add-generic-password -U -a %s -s %s -l %s -j %s -w %s%s\n" % (
+        q(user), q(KC_SERVICE), q(KC_SERVICE), q("Password for the encrypted Project Vault copies"), q(pw),
+        (" " + q(TEST_KEYCHAIN)) if TEST_KEYCHAIN else "")
+    r = subprocess.run(["security", "-i"], input=cmd.encode(), capture_output=True, timeout=20)
+    pw = confirm = cmd = None
+    if r.returncode != 0 or not have_password():
+        raise ApiError(500, "The Keychain did not accept the password.")
+    return {"ok": True}
+
+
+def api_recover(body):
+    f = os.path.abspath(os.path.expanduser(body.get("file") or ""))
+    if not os.path.isfile(f) or not (f.endswith(".tar.gz.enc") or f.endswith(".dmg")):
+        raise ApiError(400, "Choose a ProjectVault-<date>.tar.gz.enc or .dmg file.")
+    return run_script(["recover", f], timeout=900)
+
+
+
+GET_ROUTES.update({"/api/backups": api_backups, "/api/drives": api_drives, "/api/missing": api_missing})
+
 POST_ROUTES = {
     "/api/sync": api_sync, "/api/offsite": api_offsite, "/api/restore": api_restore, "/api/extras/add": api_extras_add,
     "/api/extras/remove": api_extras_remove, "/api/open": api_open, "/api/quit": api_quit,
+    "/api/usb/setup": api_usb_setup, "/api/usb/now": api_usb_now, "/api/usb/remove": api_usb_remove,
+    "/api/cloud/setup": api_cloud_setup, "/api/cloud/remove": api_cloud_remove,
+    "/api/choose/folder": api_choose_folder, "/api/choose/copy": api_choose_copy,
+    "/api/service": api_service, "/api/password": api_password, "/api/recover": api_recover,
 }
 
 SECURITY_HEADERS = [
@@ -873,6 +1140,9 @@ def main():
     if not no_open:
         subprocess.Popen(["open", url])
     threading.Thread(target=watchdog, daemon=True).start()
+    # Stop cleanly when the installer (or anyone) sends SIGTERM, so ui.json is removed.
+    import signal
+    signal.signal(signal.SIGTERM, lambda *_: threading.Thread(target=server.shutdown, daemon=True).start())
     try:
         server.serve_forever()
     except KeyboardInterrupt:

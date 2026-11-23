@@ -165,8 +165,21 @@ in your browser, but it is served only from your own Mac.
 </tr>
 </table>
 
+<img src="docs/backups.png" alt="The Backups menu: automatic backup is on with a Back up now button; the backup password is set; the cloud copy is on with its newest copy listed; the USB drive is plugged in, ExFAT, opens on Mac and Windows, with its two newest copies and buttons to copy now, show in Finder, change drive or stop using it.">
+
+
+- **Backups menu.** Everything about keeping copies, in one place:
+  - turn automatic backup on or off, or **Back up now**
+  - set or change the backup password
+  - cloud copy: **Use iCloud Drive** or **Choose a folder…**, then Copy now, Show in Finder, Turn off
+  - USB drive: pick one of the plugged-in drives (its format, free space and
+    whether Windows can read it are shown; drives are never erased), then Copy
+    now, Show in Finder, Change drive, Stop using
+- **Restore menu.** Every file that is missing from your projects in one list
+  (tick and restore), and **Recover from this copy** to bring the vault back from
+  an encrypted copy in the cloud or on the USB drive.
 - **Status at a glance.** The top bar shows how many files are missing or
-  changed, when the last backup and encrypted copy ran, and whether the
+  changed, when the last backup and encrypted copies ran, and whether the
   background job is on.
 - **Per file.** View any version, compare two versions, download any version,
   or restore it into the project.
@@ -188,6 +201,9 @@ in your browser, but it is served only from your own Mac.
 | `vault usb setup` | Keep encrypted copies on a USB drive whenever it is plugged in |
 | `vault offsite` / `vault offsite status` | Make encrypted copies now, everywhere set up / show where and when |
 | `vault usb now` / `vault usb remove` | Copy to the USB drive now / stop using it (its copies are kept) |
+| `vault offsite setup icloud` / `vault offsite setup <folder>` / `vault offsite remove` | Same as the window's buttons, without questions |
+| `vault password` | Change the backup password |
+| `vault recover <copy>` | Bring back files from an encrypted copy (`.tar.gz.enc` or `.dmg`); only adds what the vault is missing |
 | `vault service` | Is the background job on? When did the last backup and copy run? |
 | `vault stop` / `vault start` | Turn the background job off (it stays off after a restart) / on |
 | `vault help` | Every command |
@@ -291,6 +307,17 @@ vault history acme/shop-backend/.env
 vault diff acme/shop-backend/.env 2 3
 vault restore acme/shop-backend/.env --version 2
 ```
+
+**The vault folder itself was deleted or damaged.** Click **Restore → Recover
+from this copy** in the window, or:
+
+```bash
+vault recover "/Volumes/My Drive/ProjectVault Backups/ProjectVault-2026-11-23_153026.tar.gz.enc"
+```
+
+It adds every file and older version the vault is missing and never overwrites
+anything. If the vault and the copy have different versions of a file, the
+copy's is kept as `history/<name>.recovered_<date>`.
 
 **Your Mac is lost, or you have a new one.** Open the newest
 `ProjectVault-<date>.dmg` from iCloud Drive or the USB drive and type the
@@ -414,9 +441,9 @@ Credential Manager instead; contributions are welcome.
 zsh tests/smoke.sh
 ```
 
-This runs `src/vault` against a throwaway folder and checks 39 things: what is
-picked up and skipped, versions, missing sources, restores, lock recovery, both
-encrypted formats (they must refuse a wrong password, and the `.tar.gz.enc` must
+This runs `src/vault` against a throwaway folder and checks 46 things: what is
+picked up and skipped, versions, missing sources, restores, lock recovery,
+recovering from a copy, both encrypted formats (they must refuse a wrong password, and the `.tar.gz.enc` must
 open with OpenSSL 3, as shipped with Git for Windows, using the same command as
 the Windows script), and USB copies on an ExFAT disk image standing in for a
 drive. It never touches your real vault, background job or login Keychain.

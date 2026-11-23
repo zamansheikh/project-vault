@@ -10,7 +10,7 @@ umask 077
 # BSD tools first: the script relies on macOS stat/cp/diff flags.
 export PATH="/usr/bin:/bin:/usr/sbin:/sbin:$PATH"
 
-VERSION="1.1.0"
+VERSION="1.2.0"
 APP_DIR="${0:A:h}"
 # Written by install.sh: ROOT (the folder that holds your projects) and VAULT.
 CONFIG="${VAULT_CONFIG:-$HOME/Library/Application Support/ProjectVault/config}"
@@ -531,6 +531,10 @@ cmd_offsite_status() {
 # Ask for the backup password once and keep it in the login Keychain.
 ensure_password() {
   have_password && return 0
+  if [[ ! -t 0 ]]; then
+    warn "no backup password yet: set it in the Project Vault window (Backups), or run: vault password"
+    return 1
+  fi
   print
   print -r -- "Choose the backup password. Save it in your password manager FIRST:"
   print -r -- "without it, nobody can open the copies, not even you. Use standard keyboard"
@@ -894,10 +898,22 @@ cmd_service() {
   fi
 }
 
+# vault offsite setup              asks where copies go
+# vault offsite setup icloud       iCloud Drive / ProjectVault Backups, without asking
+# vault offsite setup <folder>     that folder, without asking
 cmd_offsite_setup() {
-  [[ -t 0 ]] || { warn "run this in Terminal: vault offsite setup"; return 1 }
+  local arg=$1
   local icloud="$HOME/Library/Mobile Documents/com~apple~CloudDocs" def="" dest=""
   [[ -d $icloud ]] && def="$icloud/ProjectVault Backups"
+  if [[ -n $arg ]]; then
+    if [[ $arg == icloud ]]; then
+      [[ -n $def ]] || { warn "iCloud Drive is not turned on on this Mac (System Settings > your name > iCloud)"; return 1 }
+      dest=$def
+    else
+      dest=$arg
+    fi
+  else
+  [[ -t 0 ]] || { warn "run this in Terminal: vault offsite setup (or give the folder: vault offsite setup icloud)"; return 1 }
   print -r -- "Project Vault can keep encrypted (AES-256) copies of the vault off this Mac, in a"
   print -r -- "folder that syncs to the cloud. A copy is made a day after anything changes, and"
   print -r -- "at least once a week. (For a USB drive, use: vault usb setup)"
@@ -910,7 +926,9 @@ cmd_offsite_setup() {
     print -r -- "Google Drive or Dropbox folder."
   fi
   read -r "dest?Folder: "
-  dest="${dest:-$def}"; dest="${dest/#\~/$HOME}"; dest="${dest%/}"
+  dest="${dest:-$def}"
+  fi
+  dest="${dest/#\~/$HOME}"; dest="${dest%/}"
   [[ -n $dest ]] || { warn "no folder given; nothing changed"; return 1 }
   mkdir -p "$dest" 2>/dev/null
   [[ -d $dest && -w $dest ]] || { warn "cannot write to $dest; nothing changed"; return 1 }
@@ -920,6 +938,87 @@ cmd_offsite_setup() {
   rm -f "$STATE/last-offsite" "$STATE/attempt-cloud"
   print -r -- "Saved. Making the first copy now..."
   make_copies "cloud"$'\t'"$dest"
+}
+
+cmd_offsite_remove() {
+  offsite_set DEST ""
+  rm -f "$STATE/last-offsite" "$STATE/attempt-cloud"
+  print -r -- "Cloud copies are turned off. Copies already in the folder are kept."
+}
+
+# Change (or set) the backup password. New copies use the new password; copies
+# made before keep the password they were made with.
+cmd_password() {
+  [[ -t 0 ]] || { warn "run this in Terminal (or use the Project Vault window: Backups > Password)"; return 1 }
+  print -r -- "Choose the backup password. Save it in your password manager FIRST: without it,"
+  print -r -- "nobody can open the copies, not even you. Use standard keyboard characters so it"
+  print -r -- "also works on Windows. You will type it twice."
+  have_password && print -r -- "Copies made before keep the old password; keep that one too."
+  security add-generic-password -U -a "$USER" -s "$KC_SERVICE" -l "$KC_SERVICE" \
+    -j "Password for the encrypted Project Vault copies" -w \
+    || { warn "the password was not saved"; return 1 }
+  print -r -- "Saved in your login Keychain as \"$KC_SERVICE\"."
+}
+
+# Bring files back into the vault from an encrypted copy (.tar.gz.enc or .dmg).
+# Only adds what the vault is missing; never overwrites or deletes anything.
+# A file that exists in both with different content is kept from the copy as
+# history/<name>.recovered_<date>.
+cmd_recover() {
+  local file=$1
+  [[ -n $file && -f $file ]] || { warn "usage: vault recover <ProjectVault-<date>.tar.gz.enc or .dmg>"; return 2 }
+  file=${file:A}
+  local pw
+  pw=$(security find-generic-password -s "$KC_SERVICE" -a "$USER" -w ${VAULT_KEYCHAIN:+"$VAULT_KEYCHAIN"} 2>/dev/null)
+  if [[ -z $pw ]]; then
+    if [[ -t 0 ]]; then read -rs "pw?Password of this copy: "; print
+    else warn "no backup password in the Keychain; set it first (window: Backups > Password)"; return 1; fi
+  fi
+  local work; work=$(mktemp -d "${TMPDIR:-/tmp}/projectvault-recover.XXXXXX") || return 1
+  local src="" mounted=0
+  case $file in
+    *.tar.gz.enc)
+      printf '%s\n' "$pw" | /usr/bin/openssl enc -d "${ENC_ARGS[@]}" -in "$file" -pass stdin 2>/dev/null | tar -xzf - -C "$work" 2>/dev/null
+      src="$work/_ProjectVault" ;;
+    *.dmg)
+      mkdir -p "$work/mnt"
+      printf '%s' "$pw" | hdiutil attach -quiet -nobrowse -noautoopen -readonly -stdinpass -mountpoint "$work/mnt" "$file" 2>/dev/null && mounted=1
+      src="$work/mnt/_ProjectVault" ;;
+    *) pw=""; rm -rf "$work"; warn "not a Project Vault copy (expected .tar.gz.enc or .dmg): ${file:t}"; return 2 ;;
+  esac
+  pw=""
+  if [[ ! -d $src/current ]]; then
+    (( mounted )) && hdiutil detach -quiet "$work/mnt" 2>/dev/null
+    rm -rf "$work"
+    warn "could not open ${file:t}: wrong password, or not a Project Vault copy"
+    return 1
+  fi
+  mkdir -p "$CUR" "$HIST"
+  local f rel stamp; local -i added=0 versions=0 kept=0
+  stamp=$(date +%Y-%m-%d_%H%M%S)
+  for f in "$src/current"/**/^.DS_Store(.DN); do
+    rel="${f#$src/current/}"
+    if [[ ! -e "$CUR/$rel" ]]; then
+      mkdir -p "${CUR}/${rel:h}" && cp -p "$f" "$CUR/$rel" && (( added++ ))
+    elif ! cmp -s "$f" "$CUR/$rel"; then
+      mkdir -p "${HIST}/${rel:h}" && cp -p "$f" "$HIST/$rel.recovered_$stamp" && (( kept++ ))
+    fi
+  done
+  for f in "$src/history"/**/^.DS_Store(.DN); do
+    rel="${f#$src/history/}"
+    [[ -e "$HIST/$rel" ]] && continue
+    mkdir -p "${HIST}/${rel:h}" && cp -p "$f" "$HIST/$rel" && (( versions++ ))
+  done
+  for f in extras.txt exclude.txt offsite.conf; do
+    [[ -f "$src/$f" && ! -f "$VAULT/$f" ]] && cp -p "$src/$f" "$VAULT/$f"
+  done
+  (( mounted )) && { hdiutil detach -quiet "$work/mnt" 2>/dev/null || hdiutil detach -quiet -force "$work/mnt" 2>/dev/null }
+  rm -rf "$work"
+  logline "RECOVERED from ${file:t}: $added files, $versions older versions, $kept differing copies kept as .recovered"
+  print -r -- "From ${file:t}: added $added files and $versions older versions the vault was missing."
+  (( kept )) && print -r -- "$kept files differed from the vault's copy; the copy's version is kept in history/ as <name>.recovered_$stamp"
+  (( added + versions + kept )) || print -r -- "The vault already had everything in this copy."
+  return 0
 }
 
 usage() {
@@ -943,6 +1042,9 @@ Vault folder:    $VAULT
   vault offsite               make encrypted copies now, everywhere set up (also automatic)
   vault offsite status        where copies go, and when the last ones were made
   vault usb [now|status|remove]  copy to the USB drive now / show it / stop using it
+  vault offsite remove        stop cloud copies (copies already made are kept)
+  vault password              change the backup password
+  vault recover <copy>        bring back files from an encrypted copy (.tar.gz.enc or .dmg)
 
   vault service               is the background sync on? last backup, last copy, window
   vault stop                  turn the background sync off (stays off after a restart)
@@ -992,8 +1094,9 @@ case ${1:-help} in
       setup)
         take_lock || exit 1
         trap 'rm -rf "$LOCK"' EXIT
-        cmd_offsite_setup ;;
-      *) warn "usage: vault offsite [now|status|setup]"; exit 2 ;;
+        cmd_offsite_setup "$2" ;;
+      remove) cmd_offsite_remove ;;
+      *) warn "usage: vault offsite [now|status|setup [icloud|folder]|remove]"; exit 2 ;;
     esac ;;
   status)  cmd_status ;;
   usb)
@@ -1004,6 +1107,12 @@ case ${1:-help} in
     fi
     cmd_usb "$@" ;;
   service) cmd_service ;;
+  password) cmd_password ;;
+  recover)
+    shift
+    take_lock || exit 1
+    trap 'rm -rf "$LOCK"' EXIT
+    cmd_recover "$1" && { QUIET=1; cmd_sync 0 >/dev/null 2>&1; true } ;;
   start)   cmd_start ;;
   stop)    cmd_stop ;;
   restore) shift; cmd_restore "$@" ;;

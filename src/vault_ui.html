@@ -161,12 +161,32 @@ pre.out{max-height:50vh}
 .overlay .card{background:var(--panel);border-radius:14px;padding:22px 24px;max-width:460px;box-shadow:var(--shadow)}
 .overlay p{color:var(--muted);margin:8px 0 0}
 
+.cards{display:grid;grid-template-columns:1fr 1fr;gap:14px}
+.card{border:1px solid var(--border);border-radius:12px;padding:14px 16px;background:var(--panel)}
+.card.wide{grid-column:1 / -1}
+.card + .card.wide{margin-top:0}
+#restoreBody .card + .card{margin-top:12px}
+.card p{margin:6px 0}
+.card-head{display:flex;align-items:center;justify-content:space-between;gap:10px}
+.meta{color:var(--muted);font-size:12.5px}
+.meta b{color:var(--text);font-weight:600}
+.note-card{background:var(--code-bg)}
+.ok-text{color:var(--ok)} .warn-text{color:var(--warn)}
+ul.copies{list-style:none;margin:8px 0 0;padding:0;border-top:1px solid var(--border)}
+ul.copies li{display:flex;gap:12px;align-items:center;padding:6px 0;border-bottom:1px solid var(--border);font-size:12.5px;flex-wrap:wrap}
+ul.copies li .link{margin-left:auto}
+ul.drives{list-style:none;margin:8px 0 0;padding:0}
+ul.drives li{display:flex;gap:12px;align-items:center;justify-content:space-between;padding:10px 12px;border:1px solid var(--border);border-radius:10px;margin-bottom:8px}
+.drive-main{min-width:0}
+.pwform{display:grid;gap:8px;margin-top:8px}
+.pwform input{border:1px solid var(--border);background:var(--bg);color:var(--text);border-radius:8px;padding:8px 10px;font:inherit}
 @media (max-width:1180px){
   main.cols{grid-template-columns:250px 1fr;grid-template-rows:minmax(0,46%) minmax(0,54%)}
   aside.projects{grid-row:1 / span 2}
   .pane.files{border-right:0;border-bottom:1px solid var(--border)}
 }
 @media (max-width:760px){
+  .cards{grid-template-columns:1fr}
   body{height:auto;min-height:100%}
   main.cols{display:block}
   .pane{overflow:visible;border-right:0;border-bottom:1px solid var(--border)}
@@ -186,6 +206,8 @@ pre.out{max-height:50vh}
   <div class="stats" id="stats"></div>
   <div class="actions">
     <button class="btn primary" id="btnSync">Sync now</button>
+    <button class="btn" id="btnBackups">Backups</button>
+    <button class="btn" id="btnRestore">Restore</button>
     <button class="btn" id="btnAdd">Add files</button>
     <button class="btn" id="btnExtras">Manual list</button>
     <button class="btn" id="btnFinder">Open in Finder</button>
@@ -252,6 +274,28 @@ pre.out{max-height:50vh}
   </div>
 </dialog>
 
+<dialog id="backupsDialog">
+  <div class="dlg">
+    <div class="dlg-head">
+      <h2>Backups</h2>
+      <p>How the vault is kept up to date, and where encrypted copies go. Drives are never erased or formatted.</p>
+    </div>
+    <div class="dlg-body" id="backupsBody"></div>
+    <div class="dlg-foot"><button class="link" id="backupsLog">Open the log</button><span class="spacer"></span><button class="btn primary" id="backupsClose" autofocus>Done</button></div>
+  </div>
+</dialog>
+
+<dialog id="restoreDialog">
+  <div class="dlg">
+    <div class="dlg-head">
+      <h2>Restore</h2>
+      <p>Put backed-up files back where they belong. A file is never replaced without saving the old one first.</p>
+    </div>
+    <div class="dlg-body" id="restoreBody"></div>
+    <div class="dlg-foot"><span class="spacer"></span><button class="btn primary" id="restoreClose" autofocus>Done</button></div>
+  </div>
+</dialog>
+
 <div id="expired" class="overlay" hidden>
   <div class="card">
     <h2 id="expTitle">Project Vault has stopped</h2>
@@ -286,11 +330,11 @@ function tilde(p) {
   const h = S.summary && S.summary.home;
   return h && p && p.startsWith(h) ? "~" + p.slice(h.length) : p;
 }
-function size(n) {
+function size(n) {   // decimal units, as Finder shows them
   if (n == null) return "";
-  if (n < 1024) return n + " B";
-  if (n < 1048576) return (n / 1024).toFixed(n < 10240 ? 1 : 0) + " KB";
-  return (n / 1048576).toFixed(1) + " MB";
+  const u = [["TB", 1e12], ["GB", 1e9], ["MB", 1e6], ["KB", 1e3]];
+  for (const [name, v] of u) if (n >= v) return (n / v).toFixed(n / v < 10 ? 1 : 0) + " " + name;
+  return n + " B";
 }
 function ago(at) {
   const t = new Date(at.replace(" ", "T"));
@@ -761,9 +805,325 @@ async function loadExtras() {
   } catch (e) { list.innerHTML = `<li class="empty">${esc(e.message)}</li>`; }
 }
 
+/* ---------- Backups dialog ---------- */
+
+const BK = { data: null, drives: null, pickDrive: false, showPw: false };
+
+function whenText(last) {
+  return last ? `<b>${esc(ago(last.at))}</b> <span class="muted">(${esc(last.at)})</span>` : "<b>none yet</b>";
+}
+function copiesList(copies) {
+  if (copies === undefined) return "";
+  if (copies === null) return `<p class="muted small">Could not list the copies in this folder.</p>`;
+  if (!copies.length) return `<p class="muted small">No copies here yet.</p>`;
+  return `<ul class="copies">` + copies.slice(0, 4).map(c =>
+    `<li><span class="mono">${esc(c.at)}</span><span class="muted">${esc(c.formats.join(" + "))}</span><span class="muted nowrap">${size(c.size)}</span></li>`).join("") +
+    (copies.length > 4 ? `<li class="muted">and ${copies.length - 4} older</li>` : "") + `</ul>`;
+}
+function bkChip(text, cls) { return `<span class="chip ${cls}">${text}</span>`; }
+
+async function openBackups() {
+  BK.pickDrive = false; BK.showPw = false;
+  $("#backupsBody").innerHTML = `<div class="loading">Loading…</div>`;
+  $("#backupsDialog").showModal();
+  await loadBackups();
+}
+async function loadBackups() {
+  try {
+    BK.data = await api("/api/backups");
+    if (BK.pickDrive || !BK.data.usb.configured) BK.drives = (await api("/api/drives")).drives;
+    renderBackups();
+  } catch (e) { $("#backupsBody").innerHTML = `<div class="error">${esc(e.message)}</div>`; }
+}
+
+function renderBackups() {
+  const b = BK.data, a = b.agent || {}, c = b.cloud, u = b.usb;
+
+  // 1. Automatic backup
+  const on = a.loaded && !a.disabled;
+  const lastRun = a.lastExit && !/^(0|\(never exited\))$/.test(a.lastExit) ? ` · <span class="bad-text">last run failed (${esc(a.lastExit)})</span>` : "";
+  const auto = `
+    <section class="card">
+      <div class="card-head"><h3>Automatic backup</h3>${on ? (a.running ? bkChip("Running now", "ok") : bkChip("On", "ok")) : bkChip("Off", "bad")}</div>
+      <p>${on ? "Every 15 minutes, when you log in, and when a drive is plugged in." :
+        "Turned off. Your vault is only updated when you click Back up now."}</p>
+      <p class="meta">Last backup: ${b.lastSync ? `<b>${esc(ago(b.lastSync.at))}</b> <span class="muted">(${esc(b.lastSync.at)})</span>` : "<b>never</b>"}${lastRun}</p>
+      <div class="btns"><button class="btn primary" data-bk="sync">Back up now</button>
+        ${on ? `<button class="btn" data-bk="stop">Turn off</button>` : `<button class="btn" data-bk="start">Turn on</button>`}</div>
+    </section>`;
+
+  // 2. Password
+  const pwForm = `
+      <div class="pwform">
+        <input type="password" id="pw1" placeholder="New password" autocomplete="new-password">
+        <input type="password" id="pw2" placeholder="Type it again" autocomplete="new-password">
+        <p class="muted small">At least 8 characters. Use letters, numbers, spaces and keyboard symbols, so it also works on Windows.
+        Save it in your password manager first.${b.password ? " Copies made before keep the old password." : ""}</p>
+        <div class="btns"><button class="btn primary" data-bk="pw-save">Save password</button>${b.password ? `<button class="btn" data-bk="pw-cancel">Cancel</button>` : ""}</div>
+      </div>`;
+  const pw = `
+    <section class="card">
+      <div class="card-head"><h3>Backup password</h3>${b.password ? bkChip("Set", "ok") : bkChip("Not set", "warn")}</div>
+      <p>${b.password ? "Stored in your login Keychain as “Project Vault backup”. Every encrypted copy needs it to open, so keep it in your password manager too."
+        : "Encrypted copies need a password. Choose one to start making copies."}</p>
+      ${BK.showPw || !b.password ? pwForm : `<div class="btns"><button class="btn" data-bk="pw-show">Change password</button></div>`}
+    </section>`;
+
+  // 3. Cloud folder
+  let cloud;
+  if (c.configured) {
+    cloud = `
+    <section class="card">
+      <div class="card-head"><h3>Cloud copy</h3>${c.failing ? bkChip("Last try failed", "bad") : bkChip("On", "ok")}</div>
+      <p class="mono small">${esc(c.where)}</p>
+      <p class="meta">Last copy: ${whenText(c.last)} · a day after anything changes, and at least weekly</p>
+      ${copiesList(c.copies)}
+      <div class="btns"><button class="btn primary" data-bk="copy-now">Copy now</button><button class="btn" data-bk="cloud-open">Show in Finder</button>
+        <button class="btn" data-bk="cloud-choose">Change folder…</button><button class="btn ghost" data-bk="cloud-remove">Turn off</button></div>
+    </section>`;
+  } else {
+    cloud = `
+    <section class="card">
+      <div class="card-head"><h3>Cloud copy</h3>${bkChip("Not set up", "gray")}</div>
+      <p>Keep an encrypted copy in a folder that syncs off this Mac. A copy is made a day after anything changes, and at least weekly.</p>
+      <div class="btns">${b.icloudAvailable ? `<button class="btn primary" data-bk="cloud-icloud">Use iCloud Drive</button>` : ""}
+        <button class="btn" data-bk="cloud-choose">Choose a folder…</button></div>
+      <p class="muted small">For example a Google Drive or Dropbox folder.${b.password ? "" : " Set the password first."}</p>
+    </section>`;
+  }
+
+  // 4. USB drive
+  let usb;
+  const picker = () => {
+    if (!BK.drives) return `<div class="loading">Looking for drives…</div>`;
+    if (!BK.drives.length) return `<p class="muted">No USB drive is plugged in. Plug one in, then click Refresh.</p>
+      <div class="btns"><button class="btn" data-bk="drives-refresh">Refresh</button>${u.configured ? `<button class="btn" data-bk="usb-cancel">Cancel</button>` : ""}</div>`;
+    return `<ul class="drives">` + BK.drives.map(d => {
+      const usable = d.writable && d.level !== "bad";
+      return `<li><div class="drive-main"><b>${esc(d.name)}</b> <span class="muted">${esc(d.format)} · ${size(d.free)} free of ${size(d.total)}</span>
+        <div class="small ${d.level === "ok" ? "ok-text" : d.level === "bad" ? "bad-text" : "warn-text"}">${esc(d.note)}${d.writable ? "" : " · not writable"}</div></div>
+        <button class="btn ${usable ? "primary" : ""}" data-bk="usb-use" data-mount="${esc(d.mount)}" ${usable ? "" : "disabled"}>Use this drive</button></li>`;
+    }).join("") + `</ul>
+      <p class="muted small">The drive is never erased or formatted. Project Vault only adds a “ProjectVault Backups” folder and leaves everything else on it alone.</p>
+      <div class="btns"><button class="btn" data-bk="drives-refresh">Refresh</button>${u.configured ? `<button class="btn" data-bk="usb-cancel">Cancel</button>` : ""}</div>`;
+  };
+  if (u.configured && !BK.pickDrive) {
+    const status = u.failing ? bkChip("Last try failed", "bad") : u.plugged ? bkChip("Plugged in", "ok") : bkChip("Not plugged in", "gray");
+    usb = `
+    <section class="card">
+      <div class="card-head"><h3>USB drive</h3>${status}</div>
+      <p><b>${esc(u.name)}</b>${u.plugged ? ` <span class="muted">${esc(u.format)} · ${size(u.free)} free · ${esc(u.note)}</span>` : ""}</p>
+      <p class="meta">Last copy: ${whenText(u.last)} · ${u.plugged ? "copied whenever it is plugged in and something changed" : "plug it in and a copy is made automatically"}</p>
+      ${u.plugged ? copiesList(u.copies) : ""}
+      <div class="btns">${u.plugged ? `<button class="btn primary" data-bk="usb-now">Copy now</button><button class="btn" data-bk="usb-open">Show in Finder</button>` : ""}
+        <button class="btn" data-bk="usb-change">Change drive</button><button class="btn ghost" data-bk="usb-remove">Stop using</button></div>
+    </section>`;
+  } else {
+    usb = `
+    <section class="card">
+      <div class="card-head"><h3>USB drive</h3>${u.configured ? bkChip("Changing", "warn") : bkChip("Not set up", "gray")}</div>
+      <p>Choose a drive. A copy is saved whenever it is plugged in and something changed.${b.password ? "" : " Set the password first."}</p>
+      ${picker()}
+    </section>`;
+  }
+
+  const win = `
+    <section class="card wide note-card">
+      <p class="small">Every copy is saved twice with the same password: <b>.dmg</b> opens on a Mac, <b>.tar.gz.enc</b> opens on
+      <b>Windows</b> and Linux with <a href="https://github.com/zamansheikh/project-vault/blob/main/tools/restore-windows.ps1" target="_blank" rel="noopener noreferrer">restore-windows.ps1</a>.
+      Each copy is opened and checked before it is kept; the newest 12 are kept in each place.</p>
+    </section>`;
+
+  $("#backupsBody").innerHTML = `<div class="cards">${auto}${pw}${cloud}${usb}${win}</div>`;
+}
+
+async function bkRun(btn, work) {
+  const label = btn.textContent;
+  document.querySelectorAll("#backupsDialog button").forEach(x => x.disabled = true);
+  btn.textContent = "Working…";
+  try { await work(); }
+  catch (e) { toast(e.message, true); }
+  finally {
+    btn.textContent = label;
+    document.querySelectorAll("#backupsDialog button").forEach(x => x.disabled = false);
+    await loadBackups();
+    loadSummary().catch(() => {});
+  }
+}
+function lastLine(out) {
+  const l = (out || "").trim().split("\n").filter(Boolean);
+  return l.length ? l[l.length - 1].replace(/^\d{4}-\d\d-\d\d \d\d:\d\d:\d\d\s+/, "") : "";
+}
+async function runAndReport(path, body, okText, failTitle) {
+  const r = await api(path, body);
+  if (r.ok) toast(okText || lastLine(r.output) || "Done");
+  else showOutput(failTitle || "That did not work", r.output);
+  return r;
+}
+
+$("#backupsBody").addEventListener("click", e => {
+  const btn = e.target.closest("[data-bk]");
+  if (!btn || btn.disabled) return;
+  const act = btn.dataset.bk;
+  switch (act) {
+    case "sync":   return bkRun(btn, () => runAndReport("/api/sync", {}, null, "Backup failed"));
+    case "start":  return bkRun(btn, () => runAndReport("/api/service", { action: "start" }, "Automatic backup is on"));
+    case "stop":
+      if (!confirm("Turn off automatic backups?\n\nYour vault stops updating until you turn them on again or click Back up now. It stays off after a restart.")) return;
+      return bkRun(btn, () => runAndReport("/api/service", { action: "stop" }, "Automatic backup is off"));
+    case "pw-show": BK.showPw = true; renderBackups(); $("#pw1").focus(); return;
+    case "pw-cancel": BK.showPw = false; renderBackups(); return;
+    case "pw-save": {
+      const p1 = $("#pw1").value, p2 = $("#pw2").value;
+      return bkRun(btn, async () => {
+        await api("/api/password", { password: p1, confirm: p2 });
+        BK.showPw = false;
+        toast("Password saved in your Keychain");
+      });
+    }
+    case "copy-now": return bkRun(btn, () => runAndReport("/api/offsite", {}, "Encrypted copies saved and checked", "Encrypted copy failed"));
+    case "cloud-open": return api("/api/open", { what: "cloud" }).catch(err => toast(err.message, true));
+    case "cloud-icloud": return bkRun(btn, () => runAndReport("/api/cloud/setup", { folder: "icloud" }, "iCloud Drive copies are on; first copy saved", "Could not set up iCloud Drive"));
+    case "cloud-choose": return bkRun(btn, async () => {
+      const r = await api("/api/choose/folder", {});
+      if (r.cancelled) return;
+      await runAndReport("/api/cloud/setup", { folder: r.path }, "Cloud copies are on; first copy saved", "Could not use that folder");
+    });
+    case "cloud-remove":
+      if (!confirm("Stop making cloud copies?\n\nCopies already in the folder are kept.")) return;
+      return bkRun(btn, () => runAndReport("/api/cloud/remove", {}, "Cloud copies are off"));
+    case "usb-now": return bkRun(btn, () => runAndReport("/api/usb/now", {}, "Copy saved and checked on the USB drive", "USB copy failed"));
+    case "usb-open": return api("/api/open", { what: "usb" }).catch(err => toast(err.message, true));
+    case "usb-change": BK.pickDrive = true; BK.drives = null; renderBackups(); return loadBackups();
+    case "usb-cancel": BK.pickDrive = false; renderBackups(); return;
+    case "drives-refresh": BK.drives = null; renderBackups(); return loadBackups();
+    case "usb-use": {
+      const mount = btn.dataset.mount;
+      const d = (BK.drives || []).find(x => x.mount === mount) || { name: mount };
+      if (!confirm(`Save encrypted copies on ${d.name}?\n\nNothing on the drive is erased or changed: Project Vault only adds a “ProjectVault Backups” folder.`)) return;
+      return bkRun(btn, async () => {
+        const r = await runAndReport("/api/usb/setup", { mount }, `Using ${d.name}; first copy saved and checked`, "Could not use that drive");
+        if (r.ok) BK.pickDrive = false;
+      });
+    }
+    case "usb-remove":
+      if (!confirm(`Stop using ${BK.data.usb.name}?\n\nCopies already on the drive are kept.`)) return;
+      return bkRun(btn, () => runAndReport("/api/usb/remove", {}, "The USB drive is no longer used"));
+  }
+});
+$("#backupsClose").addEventListener("click", () => $("#backupsDialog").close());
+$("#backupsLog").addEventListener("click", () => api("/api/open", { what: "log" }).catch(err => toast(err.message, true)));
+
+/* ---------- Restore dialog ---------- */
+
+const RS = { missing: [], selected: new Set(), copies: [] };
+
+async function openRestore() {
+  $("#restoreBody").innerHTML = `<div class="loading">Loading…</div>`;
+  $("#restoreDialog").showModal();
+  await loadRestore();
+}
+async function loadRestore() {
+  try {
+    const [m, b] = await Promise.all([api("/api/missing"), api("/api/backups")]);
+    RS.missing = m.files;
+    RS.selected = new Set(RS.missing.filter(f => f.projectExists).map(f => f.path));
+    RS.copies = [];
+    for (const [where, place] of [["cloud", b.cloud], ["usb", b.usb]]) {
+      for (const c of (place && place.copies) || []) {
+        const file = c.files.find(n => n.endsWith(".tar.gz.enc")) || c.files[0];
+        RS.copies.push({ where: where === "cloud" ? "Cloud" : (place.name || "USB drive"), at: c.at, path: c.dir + "/" + file });
+      }
+    }
+    RS.copies.sort((x, y) => y.at.localeCompare(x.at));
+    renderRestore();
+  } catch (e) { $("#restoreBody").innerHTML = `<div class="error">${esc(e.message)}</div>`; }
+}
+
+function renderRestore() {
+  const ready = RS.missing.filter(f => f.projectExists), waiting = RS.missing.filter(f => !f.projectExists);
+  let missing;
+  if (!RS.missing.length) {
+    missing = `<p class="ok-text">Nothing is missing: every backed-up file is in its project.</p>`;
+  } else {
+    missing = (ready.length ? `<ul class="listbox candlist" style="height:auto;max-height:30vh">` + ready.map(f =>
+        `<li><label><input type="checkbox" data-rs="${esc(f.path)}" ${RS.selected.has(f.path) ? "checked" : ""}>
+         <span class="cname mono" title="${esc(f.path)}">${esc(f.path)}</span></label><span class="ver">v${f.version}</span></li>`).join("") + `</ul>` : "") +
+      (waiting.length ? `<p class="muted small" style="margin-top:10px">${waiting.length} more file(s) belong to project folders that do not exist on this Mac
+        (${esc([...new Set(waiting.map(f => f.project))].slice(0, 4).join(", "))}${new Set(waiting.map(f => f.project)).size > 4 ? ", …" : ""}).
+        Clone those projects first, then come back here.</p>` : "") +
+      (ready.length ? `<div class="btns"><button class="btn primary" data-rsa="restore" ${RS.selected.size ? "" : "disabled"}>Restore ${RS.selected.size} selected</button></div>` : "");
+  }
+  const copies = RS.copies.length ? `<ul class="copies">` + RS.copies.slice(0, 6).map(c =>
+      `<li><span class="mono">${esc(c.at)}</span><span class="muted">${esc(c.where)}</span><button class="link" data-rsa="recover" data-file="${esc(c.path)}">Recover from this copy</button></li>`).join("") + `</ul>`
+    : `<p class="muted small">No copies found in your cloud folder or on a plugged-in USB drive.</p>`;
+
+  $("#restoreBody").innerHTML = `
+    <section class="card wide">
+      <div class="card-head"><h3>Files missing from your projects</h3>${RS.missing.length ? bkChip(RS.missing.length + " missing", "bad") : bkChip("All present", "ok")}</div>
+      <p class="muted small">For example after you cloned a project again. If a project already has a different copy of a file, it is saved in the vault's history before being replaced.</p>
+      ${missing}
+    </section>
+    <section class="card wide">
+      <div class="card-head"><h3>One project, or an older version</h3></div>
+      <p>Pick a project on the left and click <b>Restore all to project</b>. To go back to an older version of a file, pick the file and click <b>Restore</b> next to that version.</p>
+    </section>
+    <section class="card wide">
+      <div class="card-head"><h3>From an encrypted copy</h3></div>
+      <p class="muted small">If the vault itself was lost or damaged. This only adds files and versions the vault is missing; nothing in it is overwritten or deleted. Uses the backup password in your Keychain.</p>
+      ${copies}
+      <div class="btns"><button class="btn" data-rsa="choose">Choose a copy file…</button></div>
+    </section>`;
+}
+
+async function rsRun(btn, work) {
+  const label = btn.textContent;
+  document.querySelectorAll("#restoreDialog button").forEach(x => x.disabled = true);
+  btn.textContent = "Working…";
+  try { await work(); }
+  catch (e) { toast(e.message, true); }
+  finally {
+    btn.textContent = label;
+    document.querySelectorAll("#restoreDialog button").forEach(x => x.disabled = false);
+    await loadRestore();
+    refreshAll();
+  }
+}
+async function recoverFrom(path) {
+  const name = path.split("/").pop();
+  if (!confirm(`Bring back files from ${name}?\n\nOnly files and versions the vault is missing are added. Nothing is overwritten or deleted.`)) return;
+  const r = await api("/api/recover", { file: path });
+  showOutput(r.ok ? "Recovered" : "Could not recover", r.output);
+}
+
+$("#restoreBody").addEventListener("change", e => {
+  const c = e.target.closest("[data-rs]");
+  if (!c) return;
+  if (c.checked) RS.selected.add(c.dataset.rs); else RS.selected.delete(c.dataset.rs);
+  const b = $('[data-rsa="restore"]');
+  if (b) { b.textContent = `Restore ${RS.selected.size} selected`; b.disabled = !RS.selected.size; }
+});
+$("#restoreBody").addEventListener("click", e => {
+  const btn = e.target.closest("[data-rsa]");
+  if (!btn || btn.disabled) return;
+  if (btn.dataset.rsa === "restore") {
+    const paths = [...RS.selected];
+    if (!confirm(`Put ${paths.length} file(s) back into their projects?`)) return;
+    return rsRun(btn, async () => { const r = await api("/api/restore", { paths }); showOutput(r.ok ? "Restored" : "Restore had problems", r.output); });
+  }
+  if (btn.dataset.rsa === "recover") return rsRun(btn, () => recoverFrom(btn.dataset.file));
+  if (btn.dataset.rsa === "choose") return rsRun(btn, async () => {
+    const r = await api("/api/choose/copy", {});
+    if (!r.cancelled) await recoverFrom(r.path);
+  });
+});
+$("#restoreClose").addEventListener("click", () => $("#restoreDialog").close());
+
 /* ---------- wiring ---------- */
 
 $("#btnSync").addEventListener("click", doSync);
+$("#btnBackups").addEventListener("click", openBackups);
+$("#btnRestore").addEventListener("click", openRestore);
 $("#btnAdd").addEventListener("click", () => openAdd(S.projectData && !S.projectData.isGroup ? S.projectData.name : ""));
 $("#btnExtras").addEventListener("click", () => { $("#extrasDialog").showModal(); loadExtras(); });
 $("#btnFinder").addEventListener("click", () => openIn("vault"));
@@ -886,6 +1246,8 @@ loadSummary().then(async () => {
   if (h.get("project")) await selectProject(h.get("project"));
   if (h.get("file")) await selectFile(h.get("file"));
   if (h.has("add")) openAdd(h.get("add"));
+  if (h.has("backups")) openBackups();
+  if (h.has("restore")) openRestore();
 }).catch(e => { $("#projectList").innerHTML = `<li class="empty">${esc(e.message)}</li>`; });
 setInterval(() => { if (!stopped) loadSummary().catch(() => {}); }, 60000);
 </script>

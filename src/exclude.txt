@@ -1,0 +1,7 @@
+# Paths that are never backed up, one per line, relative to your projects folder.
+# A folder here excludes everything inside it. Lines starting with # are ignored.
+#
+# Use it for third-party code or samples that contain .env or key files that
+# are not yours. Examples:
+#   vendor/some-sdk
+#   experiments/reverse-engineering

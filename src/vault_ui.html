@@ -1,0 +1,886 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Project Vault</title>
+<style>
+:root{
+  --bg:#f5f6f8; --panel:#fff; --text:#1b2130; --muted:#667085; --faint:#98a2b3;
+  --border:#e3e6eb; --hover:#f2f4f7; --sel:#e9eefc; --sel-border:#c7d4fb;
+  --accent:#3451d1; --accent-hover:#2a43b4; --on-accent:#fff;
+  --ok:#16794a; --ok-bg:#e5f5ec; --warn:#8a5a00; --warn-bg:#fff3d6;
+  --bad:#b42318; --bad-bg:#fdebea; --gray:#475467; --gray-bg:#eef0f3;
+  --code-bg:#f7f8fa; --shadow:0 12px 32px rgba(16,24,40,.14);
+  color-scheme:light;
+}
+/* Dark follows the Mac's setting; #theme=dark or #theme=light in the address forces one. */
+@media (prefers-color-scheme: dark){
+  :root:not([data-theme="light"]){
+    --bg:#0e1015; --panel:#161920; --text:#e7e9ee; --muted:#9aa3b2; --faint:#6b7483;
+    --border:#272c36; --hover:#1d2129; --sel:#1c2645; --sel-border:#33447a;
+    --accent:#7d95ff; --accent-hover:#97a9ff; --on-accent:#0b0e16;
+    --ok:#5ad08f; --ok-bg:#11291c; --warn:#f2c450; --warn-bg:#2e250c;
+    --bad:#ff8a80; --bad-bg:#341515; --gray:#b0b8c6; --gray-bg:#232833;
+    --code-bg:#101319; --shadow:0 12px 32px rgba(0,0,0,.55);
+    color-scheme:dark;
+  }
+}
+:root[data-theme="dark"]{
+  --bg:#0e1015; --panel:#161920; --text:#e7e9ee; --muted:#9aa3b2; --faint:#6b7483;
+  --border:#272c36; --hover:#1d2129; --sel:#1c2645; --sel-border:#33447a;
+  --accent:#7d95ff; --accent-hover:#97a9ff; --on-accent:#0b0e16;
+  --ok:#5ad08f; --ok-bg:#11291c; --warn:#f2c450; --warn-bg:#2e250c;
+  --bad:#ff8a80; --bad-bg:#341515; --gray:#b0b8c6; --gray-bg:#232833;
+  --code-bg:#101319; --shadow:0 12px 32px rgba(0,0,0,.55);
+  color-scheme:dark;
+}
+*{box-sizing:border-box}
+html,body{height:100%}
+body{margin:0;background:var(--bg);color:var(--text);display:flex;flex-direction:column;
+  font:13.5px/1.45 -apple-system,BlinkMacSystemFont,"SF Pro Text","Segoe UI",system-ui,sans-serif}
+.mono{font-family:ui-monospace,"SF Mono",Menlo,monospace;font-size:12.5px}
+.muted{color:var(--muted)} .small{font-size:12px} .nowrap{white-space:nowrap} .right{text-align:right}
+.bad-text{color:var(--bad);font-weight:550}
+[hidden]{display:none!important}
+
+header.top{display:flex;align-items:center;gap:14px;padding:12px 18px;background:var(--panel);border-bottom:1px solid var(--border);flex-wrap:wrap}
+.brand{display:flex;align-items:center;gap:8px;font-weight:650;font-size:15px}
+.brand svg{color:var(--accent);flex-shrink:0}
+.stats{display:flex;gap:6px;flex-wrap:wrap}
+.pill{border:1px solid var(--border);border-radius:999px;padding:2px 10px;color:var(--muted);background:transparent;font:inherit;font-size:12.5px}
+.pill b{color:var(--text);font-weight:600;font-variant-numeric:tabular-nums}
+button.pill{cursor:pointer} button.pill:hover{background:var(--hover)}
+.pill.bad{border-color:transparent;background:var(--bad-bg);color:var(--bad)} .pill.bad b{color:var(--bad)}
+.pill.warn{border-color:transparent;background:var(--warn-bg);color:var(--warn)} .pill.warn b{color:var(--warn)}
+.actions{margin-left:auto;display:flex;gap:8px;flex-wrap:wrap}
+.subline{padding:6px 18px;color:var(--muted);font-size:12.5px;border-bottom:1px solid var(--border);background:var(--panel)}
+.subline b{color:var(--text);font-weight:600}
+
+.btn{appearance:none;border:1px solid var(--border);background:var(--panel);color:var(--text);border-radius:8px;padding:6px 12px;
+  font:inherit;font-weight:500;cursor:pointer;text-decoration:none;display:inline-flex;align-items:center;gap:6px;white-space:nowrap}
+.btn:hover{background:var(--hover)}
+.btn.primary{background:var(--accent);border-color:var(--accent);color:var(--on-accent)}
+.btn.primary:hover{background:var(--accent-hover)}
+.btn:disabled{opacity:.5;cursor:default}
+.btn.ghost{border-color:transparent;color:var(--muted)}
+.link{appearance:none;border:0;background:none;color:var(--accent);font:inherit;cursor:pointer;padding:2px 4px;text-decoration:none;border-radius:4px}
+.link:hover{text-decoration:underline}
+:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+
+main.cols{flex:1;min-height:0;display:grid;grid-template-columns:280px minmax(320px,1fr) minmax(380px,1.15fr)}
+.pane{min-height:0;overflow:auto;border-right:1px solid var(--border)}
+.pane:last-child{border-right:0}
+aside.projects{background:var(--panel);display:flex;flex-direction:column;overflow:hidden}
+.search{padding:12px;border-bottom:1px solid var(--border)}
+input[type=search],input.filter,select{width:100%;border:1px solid var(--border);background:var(--bg);color:var(--text);border-radius:8px;padding:7px 10px;font:inherit}
+select{width:auto}
+.filters{display:flex;gap:6px;margin-top:8px;flex-wrap:wrap}
+.fchip{border:1px solid var(--border);background:transparent;color:var(--muted);border-radius:999px;padding:2px 10px;font:inherit;font-size:12px;cursor:pointer}
+.fchip.on{background:var(--sel);border-color:var(--sel-border);color:var(--text)}
+#projectList{list-style:none;margin:0;padding:6px 6px 16px;overflow:auto;flex:1}
+#projectList .group{padding:10px 10px 3px;font-size:11px;text-transform:uppercase;letter-spacing:.06em;color:var(--faint);font-weight:650}
+.proj,.dir{width:100%;display:flex;align-items:center;gap:8px;justify-content:space-between;border:0;background:none;color:var(--text);
+  font:inherit;text-align:left;padding:6px 10px;border-radius:7px;cursor:pointer}
+.proj.indent{padding-left:18px}
+.proj:hover,.dir:hover{background:var(--hover)} .proj.sel{background:var(--sel)}
+.pname,.cname{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0}
+.pmeta{display:flex;align-items:center;gap:6px;flex-shrink:0}
+.count{color:var(--muted);font-size:12px;font-variant-numeric:tabular-nums}
+.dot{width:7px;height:7px;border-radius:50%} .dot.bad{background:var(--bad)} .dot.warn{background:var(--warn)}
+li.empty{padding:14px 12px;color:var(--muted)}
+
+.pane-head{padding:16px 18px 14px;border-bottom:1px solid var(--border);background:var(--panel)}
+.eyebrow{font-size:11px;text-transform:uppercase;letter-spacing:.06em;color:var(--faint);font-weight:650}
+h2{margin:2px 0;font-size:17px;font-weight:650;word-break:break-all}
+h3{margin:0;font-size:13px;font-weight:650}
+.path{color:var(--muted);word-break:break-all}
+.btns{display:flex;gap:8px;flex-wrap:wrap;margin-top:12px}
+.tbl{width:100%;border-collapse:collapse}
+.tbl th{text-align:left;font-size:11.5px;color:var(--muted);font-weight:600;padding:8px 12px;border-bottom:1px solid var(--border);white-space:nowrap}
+.tbl td{padding:8px 12px;border-bottom:1px solid var(--border);vertical-align:middle}
+.files tbody tr{cursor:pointer} .files tbody tr:hover{background:var(--hover)} .files tbody tr.sel{background:var(--sel)}
+.files tbody tr.hit .fname{text-decoration:underline;text-decoration-color:var(--accent);text-underline-offset:3px}
+.fname{word-break:break-all}
+.ver{display:inline-block;font:11.5px ui-monospace,"SF Mono",Menlo,monospace;background:var(--gray-bg);color:var(--gray);border-radius:5px;padding:1px 6px}
+.tag{font-size:11px;color:var(--accent);font-weight:650;margin-left:4px}
+.chip{display:inline-flex;align-items:center;gap:5px;border-radius:999px;padding:2px 9px;font-size:12px;font-weight:550;white-space:nowrap}
+.chip::before{content:"";width:6px;height:6px;border-radius:50%;background:currentColor}
+.chip.ok{background:var(--ok-bg);color:var(--ok)} .chip.warn{background:var(--warn-bg);color:var(--warn)}
+.chip.bad{background:var(--bad-bg);color:var(--bad)} .chip.gray{background:var(--gray-bg);color:var(--gray)}
+.section{padding:16px 18px;border-bottom:1px solid var(--border)}
+.section-head{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:10px;flex-wrap:wrap}
+.note{display:flex;gap:10px;align-items:center;flex-wrap:wrap;padding:10px 12px;border-radius:8px;background:var(--code-bg);border:1px solid var(--border);color:var(--muted);margin-top:12px}
+pre.code{margin:0;background:var(--code-bg);border:1px solid var(--border);border-radius:8px;padding:12px;overflow:auto;max-height:360px;
+  font:12.5px/1.55 ui-monospace,"SF Mono",Menlo,monospace;white-space:pre;tab-size:2}
+pre.code .line{display:block;min-height:1.55em}
+.mask{color:var(--faint);letter-spacing:1px}
+.diff .add{color:var(--ok);background:var(--ok-bg)} .diff .del{color:var(--bad);background:var(--bad-bg)} .diff .hunk{color:var(--accent)}
+.hidden-note{color:var(--muted);font-style:italic}
+.row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+.toggle{display:inline-flex;gap:6px;align-items:center;color:var(--muted);cursor:pointer;user-select:none}
+.empty-state{min-height:100%;display:flex;flex-direction:column;align-items:center;justify-content:center;text-align:center;color:var(--muted);padding:32px;gap:6px}
+.empty-state b{color:var(--text);font-size:14px}
+.empty-state svg{color:var(--faint);margin-bottom:6px}
+.loading{padding:24px 18px;color:var(--muted)}
+.error{margin:18px;padding:12px;border-radius:8px;background:var(--bad-bg);color:var(--bad)}
+
+dialog{border:1px solid var(--border);border-radius:14px;background:var(--panel);color:var(--text);padding:0;
+  width:min(900px,calc(100vw - 32px));max-height:calc(100vh - 48px);box-shadow:var(--shadow)}
+dialog.narrow{width:min(620px,calc(100vw - 32px))}
+dialog::backdrop{background:rgba(10,12,18,.45)}
+.dlg{display:flex;flex-direction:column;max-height:calc(100vh - 50px)}
+.dlg-head{padding:18px 20px 6px}
+.dlg-head p{margin:6px 0 0;color:var(--muted)}
+.dlg-body{padding:10px 20px 16px;overflow:auto;flex:1;min-height:0}
+.dlg-foot{padding:12px 20px;border-top:1px solid var(--border);display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+.spacer{flex:1}
+.crumbs{display:flex;flex-wrap:wrap;gap:2px;align-items:center;margin-bottom:12px;color:var(--muted)}
+.addcols{display:grid;grid-template-columns:250px 1fr;gap:16px}
+.addcols h3{margin-bottom:8px}
+.listbox{list-style:none;margin:0;padding:4px;border:1px solid var(--border);border-radius:10px;overflow:auto;height:44vh;min-height:220px}
+.candlist{padding:0}
+.candlist li{display:flex;align-items:center;gap:10px;padding:7px 10px;border-bottom:1px solid var(--border)}
+.candlist li:last-child{border-bottom:0}
+.candlist li.locked{color:var(--muted)}
+.candlist label{display:flex;align-items:center;gap:10px;flex:1;min-width:0;cursor:pointer}
+.candlist input{flex-shrink:0}
+.badge{font-size:11px;padding:1px 7px;border-radius:999px;background:var(--gray-bg);color:var(--gray);white-space:nowrap}
+.badge.ok{background:var(--ok-bg);color:var(--ok)} .badge.bad{background:var(--bad-bg);color:var(--bad)}
+#candFilter{margin-bottom:8px}
+#candNote{margin:8px 0 0;color:var(--muted);font-size:12px}
+.extras li{display:flex;align-items:center;gap:10px;padding:8px 10px;border-bottom:1px solid var(--border)}
+.extras li .cname{flex:1}
+pre.out{max-height:50vh}
+
+#toast{position:fixed;right:18px;bottom:18px;max-width:440px;background:var(--text);color:var(--panel);padding:10px 14px;border-radius:10px;
+  box-shadow:var(--shadow);opacity:0;transform:translateY(8px);transition:opacity .2s,transform .2s;pointer-events:none;font-size:13px;z-index:20}
+#toast.show{opacity:1;transform:none}
+#toast.err{background:var(--bad);color:#fff}
+.overlay{position:fixed;inset:0;background:rgba(10,12,18,.55);display:flex;align-items:center;justify-content:center;z-index:30;padding:16px}
+.overlay .card{background:var(--panel);border-radius:14px;padding:22px 24px;max-width:460px;box-shadow:var(--shadow)}
+.overlay p{color:var(--muted);margin:8px 0 0}
+
+@media (max-width:1180px){
+  main.cols{grid-template-columns:250px 1fr;grid-template-rows:minmax(0,46%) minmax(0,54%)}
+  aside.projects{grid-row:1 / span 2}
+  .pane.files{border-right:0;border-bottom:1px solid var(--border)}
+}
+@media (max-width:760px){
+  body{height:auto;min-height:100%}
+  main.cols{display:block}
+  .pane{overflow:visible;border-right:0;border-bottom:1px solid var(--border)}
+  aside.projects{overflow:visible} #projectList{max-height:45vh}
+  .actions{margin-left:0}
+  .addcols{grid-template-columns:1fr} .listbox{height:32vh}
+  header.top,.subline{padding-left:16px;padding-right:16px}
+}
+</style>
+</head>
+<body>
+<header class="top">
+  <div class="brand">
+    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="4" y="10" width="16" height="11" rx="2.5"/><path d="M8 10V7a4 4 0 0 1 8 0v3"/><circle cx="12" cy="15.5" r="1.4"/></svg>
+    Project Vault
+  </div>
+  <div class="stats" id="stats"></div>
+  <div class="actions">
+    <button class="btn primary" id="btnSync">Sync now</button>
+    <button class="btn" id="btnAdd">Add files</button>
+    <button class="btn" id="btnExtras">Manual list</button>
+    <button class="btn" id="btnFinder">Open in Finder</button>
+    <button class="btn ghost" id="btnQuit" title="Stop Project Vault">Quit</button>
+  </div>
+</header>
+<div class="subline" id="subline">Loading…</div>
+
+<main class="cols">
+  <aside class="pane projects">
+    <div class="search">
+      <input type="search" id="search" placeholder="Search projects and files" autocomplete="off" spellcheck="false">
+      <div class="filters" id="filters"></div>
+    </div>
+    <ul id="projectList"><li class="empty">Loading…</li></ul>
+  </aside>
+  <section class="pane files" id="filesPane"></section>
+  <section class="pane detail" id="detailPane"></section>
+</main>
+
+<dialog id="addDialog">
+  <div class="dlg">
+    <div class="dlg-head">
+      <h2>Add files to the vault</h2>
+      <p>.env files, Firebase files and keystores in your projects folder are backed up automatically. Use this for anything else a project needs that git ignores.</p>
+    </div>
+    <div class="dlg-body">
+      <nav class="crumbs" id="crumbs" aria-label="Folder"></nav>
+      <div class="addcols">
+        <div><h3>Folders</h3><ul class="listbox" id="dirList"></ul></div>
+        <div>
+          <h3>Files here that git does not track</h3>
+          <input class="filter" id="candFilter" placeholder="Filter files" autocomplete="off" spellcheck="false">
+          <ul class="listbox candlist" id="candList"></ul>
+          <p id="candNote"></p>
+        </div>
+      </div>
+    </div>
+    <div class="dlg-foot">
+      <button class="btn" id="addFolder">Add this whole folder</button>
+      <span class="spacer"></span>
+      <button class="btn" id="addCancel">Cancel</button>
+      <button class="btn primary" id="addConfirm" disabled>Add selected</button>
+    </div>
+  </div>
+</dialog>
+
+<dialog id="extrasDialog" class="narrow">
+  <div class="dlg">
+    <div class="dlg-head">
+      <h2>Manual list</h2>
+      <p>Files and folders you added by hand (extras.txt). Removing one stops future backups of it; copies already in the vault are kept.</p>
+    </div>
+    <div class="dlg-body"><ul class="listbox extras" id="extrasList" style="height:auto;max-height:52vh"></ul></div>
+    <div class="dlg-foot"><span class="spacer"></span><button class="btn" id="extrasAdd">Add files</button><button class="btn primary" id="extrasClose">Done</button></div>
+  </div>
+</dialog>
+
+<dialog id="outDialog" class="narrow">
+  <div class="dlg">
+    <div class="dlg-head"><h2 id="outTitle"></h2></div>
+    <div class="dlg-body"><pre class="code out" id="outText"></pre></div>
+    <div class="dlg-foot"><span class="spacer"></span><button class="btn primary" id="outClose">OK</button></div>
+  </div>
+</dialog>
+
+<div id="expired" class="overlay" hidden>
+  <div class="card">
+    <h2 id="expTitle">Project Vault has stopped</h2>
+    <p id="expText">It stops after 15 idle minutes. Open it again from the Project Vault app, or run <span class="mono">vault ui</span> in Terminal.</p>
+  </div>
+</div>
+<div id="toast" role="status" aria-live="polite"></div>
+
+<script>
+"use strict";
+const $ = (s, el = document) => el.querySelector(s);
+const enc = encodeURIComponent;
+const S = { summary: null, project: null, projectData: null, file: null, fileData: null,
+            filter: "all", search: "", reveal: false, previewV: null, previewText: null, diff: null };
+
+const STATUS = {
+  ok: ["Backed up", "ok"], changed: ["Changed", "warn"], missing: ["Missing in project", "bad"],
+  unwatched: ["Not watched", "gray"], unknown: ["Unknown", "gray"],
+};
+const EXPLAIN = {
+  ok: "The vault copy matches the file in the project.",
+  changed: "The project's copy was edited after the last sync. The next sync (or Sync now) saves it as a new version.",
+  missing: "The project no longer has this file. The vault still does: use Restore to put it back.",
+  unwatched: "The project still has this file, but the vault no longer picks it up (git now tracks it, or it left the manual list). This copy is kept.",
+  unknown: "Could not compare with the project's copy.",
+};
+
+function esc(v) {
+  return String(v == null ? "" : v).replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+}
+function tilde(p) {
+  const h = S.summary && S.summary.home;
+  return h && p && p.startsWith(h) ? "~" + p.slice(h.length) : p;
+}
+function size(n) {
+  if (n == null) return "";
+  if (n < 1024) return n + " B";
+  if (n < 1048576) return (n / 1024).toFixed(n < 10240 ? 1 : 0) + " KB";
+  return (n / 1048576).toFixed(1) + " MB";
+}
+function ago(at) {
+  const t = new Date(at.replace(" ", "T"));
+  const s = (Date.now() - t) / 1000;
+  if (isNaN(s)) return at;
+  if (s < 60) return "just now";
+  if (s < 3600) return Math.round(s / 60) + " min ago";
+  if (s < 86400) return Math.round(s / 3600) + " h ago";
+  return Math.round(s / 86400) + " days ago";
+}
+function chip(st) { const [l, c] = STATUS[st] || STATUS.unknown; return `<span class="chip ${c}">${l}</span>`; }
+const THEME = ["dark", "light"].includes(new URLSearchParams(location.hash.slice(1)).get("theme"))
+  ? new URLSearchParams(location.hash.slice(1)).get("theme") : "";
+if (THEME) document.documentElement.dataset.theme = THEME;
+function rootName() {
+  const r = S.summary && S.summary.root;
+  return r ? r.split("/").filter(Boolean).pop() : "Projects";
+}
+/* The address keeps the selected project and file (#project=…&file=…), so a reload keeps your place. */
+function setHash() {
+  const p = new URLSearchParams();
+  if (THEME) p.set("theme", THEME);
+  if (S.project) p.set("project", S.project);
+  if (S.file) p.set("file", S.file);
+  history.replaceState(null, "", p.toString() ? "#" + p.toString() : location.pathname);
+}
+function dl(path, v) { return "/api/download?path=" + enc(path) + (v != null ? "&v=" + v : ""); }
+function emptyState(title, text) {
+  return `<div class="empty-state"><svg width="34" height="34" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="4" y="10" width="16" height="11" rx="2.5"/><path d="M8 10V7a4 4 0 0 1 8 0v3"/></svg><b>${title}</b><span>${text}</span></div>`;
+}
+
+let stopped = false;
+function showStopped(title, text) {
+  stopped = true;
+  if (title) $("#expTitle").textContent = title;
+  if (text) $("#expText").textContent = text;
+  $("#expired").hidden = false;
+}
+async function api(path, body) {
+  const opt = { credentials: "same-origin", headers: {} };
+  if (body !== undefined) {
+    opt.method = "POST";
+    opt.headers["Content-Type"] = "application/json";
+    opt.headers["X-Vault-Request"] = "1";
+    opt.body = JSON.stringify(body);
+  }
+  let r;
+  try { r = await fetch(path, opt); }
+  catch (e) { showStopped(); throw new Error("Project Vault is not running."); }
+  let data = {};
+  try { data = await r.json(); } catch (e) { /* not JSON */ }
+  if (r.status === 403) showStopped();
+  if (!r.ok) throw new Error(data.error || "Error " + r.status);
+  return data;
+}
+
+let toastTimer;
+function toast(msg, err) {
+  const t = $("#toast");
+  t.textContent = msg;
+  t.className = "show" + (err ? " err" : "");
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => { t.className = ""; }, err ? 6000 : 3500);
+}
+function showOutput(title, text) {
+  $("#outTitle").textContent = title;
+  $("#outText").textContent = text || "(no output)";
+  $("#outDialog").showModal();
+}
+
+/* ---------- header and project list ---------- */
+
+async function loadSummary() {
+  S.summary = await api("/api/summary");
+  renderHeader();
+  renderProjects();
+}
+
+function renderHeader() {
+  const s = S.summary, t = s.totals;
+  $("#stats").innerHTML =
+    `<span class="pill"><b>${t.files}</b> files</span><span class="pill"><b>${s.projectCount}</b> projects</span>` +
+    `<button class="pill ${t.missing ? "bad" : ""}" data-filter="missing" title="Show projects with missing files"><b>${t.missing}</b> missing</button>` +
+    `<button class="pill ${t.changed ? "warn" : ""}" data-filter="changed" title="Show projects with unsaved changes"><b>${t.changed}</b> changed</button>`;
+  const a = s.agent || {}, ls = s.lastSync;
+  let job = !a.loaded ? `<span class="bad-text">Background sync is off</span>`
+    : a.running ? "Background sync is running now" : "Background sync on, every 15 min";
+  if (a.loaded && a.lastExit && !/^(0|\(never exited\))$/.test(a.lastExit)) {
+    job += ` · <span class="bad-text">last run failed (${esc(a.lastExit)})</span>`;
+  }
+  const o = s.offsite || {};
+  let off = "Off-disk copy: not set up";
+  if (o.configured) {
+    off = `Encrypted copy in ${esc(tilde(o.where))}: ` + (o.last ? `<b>${esc(ago(o.last.at))}</b>` : "<b>none yet</b>") +
+      (o.failing ? ` <span class="bad-text">(last try failed)</span>` : "") +
+      ` <button class="link" id="offsiteNow">Copy now</button>`;
+  }
+  $("#subline").innerHTML = (ls ? `Last sync <b>${esc(ago(ls.at))}</b> <span class="muted">(${esc(ls.at)})</span>` : "Never synced") +
+    ` · ${job} · ${off}`;
+  const f = [["all", "All", s.projectCount], ["missing", "Missing", s.projects.filter(p => p.missing).length],
+             ["changed", "Changed", s.projects.filter(p => p.changed).length]];
+  $("#filters").innerHTML = f.map(([k, l, n]) => `<button class="fchip ${S.filter === k ? "on" : ""}" data-filter="${k}">${l} ${n}</button>`).join("");
+}
+
+function renderProjects() {
+  const s = S.summary;
+  if (!s) return;
+  const term = S.search.trim().toLowerCase();
+  const fileHits = new Set();
+  if (term) for (const f of s.files) if (f.path.toLowerCase().includes(term)) fileHits.add(f.project);
+  const list = s.projects.filter(p => {
+    if (S.filter === "missing" && !p.missing) return false;
+    if (S.filter === "changed" && !p.changed) return false;
+    return !term || p.name.toLowerCase().includes(term) || fileHits.has(p.name);
+  });
+  const groups = new Map();
+  for (const p of list) {
+    const i = p.name.indexOf("/");
+    const g = p.name.startsWith("(") || i < 0 ? p.name : p.name.slice(0, i);
+    if (!groups.has(g)) groups.set(g, []);
+    groups.get(g).push(p);
+  }
+  let html = "";
+  for (const [g, ps] of groups) {
+    const single = ps.length === 1 && ps[0].name === g;
+    if (!single) html += `<li class="group">${esc(g)}</li>`;
+    for (const p of ps) {
+      const label = single ? p.name : p.name === g ? "files in this folder" : p.name.slice(g.length + 1);
+      html += `<li><button class="proj ${S.project === p.name ? "sel" : ""} ${single ? "" : "indent"}" data-name="${esc(p.name)}" title="${esc(p.name)}">` +
+        `<span class="pname">${esc(label)}</span><span class="pmeta">` +
+        (p.missing ? `<span class="dot bad" title="${p.missing} missing"></span>` : "") +
+        (p.changed ? `<span class="dot warn" title="${p.changed} changed"></span>` : "") +
+        `<span class="count">${p.files}</span></span></button></li>`;
+    }
+  }
+  $("#projectList").innerHTML = html || `<li class="empty">No projects match.</li>`;
+}
+
+/* ---------- files of a project ---------- */
+
+async function selectProject(name, keepFile) {
+  S.project = name;
+  setHash();
+  renderProjects();
+  if (!keepFile) { S.file = null; S.fileData = null; renderDetailEmpty(); }
+  const pane = $("#filesPane");
+  if (!S.projectData || S.projectData.name !== name) pane.innerHTML = `<div class="loading">Loading…</div>`;
+  try {
+    S.projectData = await api("/api/project?name=" + enc(name));
+    renderFiles();
+  } catch (e) {
+    pane.innerHTML = `<div class="error">${esc(e.message)}</div>`;
+  }
+}
+
+function renderFiles() {
+  const p = S.projectData, term = S.search.trim().toLowerCase();
+  const rows = p.files.map(f =>
+    `<tr class="${S.file === f.path ? "sel" : ""} ${term && f.path.toLowerCase().includes(term) ? "hit" : ""}" data-path="${esc(f.path)}" tabindex="0">` +
+    `<td class="mono fname">${esc(f.name)}</td><td><span class="ver">v${f.version}</span></td>` +
+    `<td class="muted nowrap">${esc(f.edited)}</td><td>${chip(f.status)}</td></tr>`).join("");
+  $("#filesPane").innerHTML = `
+    <div class="pane-head">
+      <div class="eyebrow">Project</div>
+      <h2>${esc(p.name)}</h2>
+      <div class="path mono">${esc(tilde(p.source))}${p.sourceExists ? "" : ` <span class="chip bad">folder missing</span>`}</div>
+      <div class="btns">
+        <a class="btn" href="/api/download-project?name=${enc(p.name)}" download>Download all (.zip)</a>
+        <button class="btn" data-act="restore-project">Restore all to project</button>
+        <button class="btn" data-act="finder-project">Show in Finder</button>
+        ${p.isGroup ? "" : `<button class="btn" data-act="add-here">Add files</button>`}
+      </div>
+    </div>
+    <table class="tbl files">
+      <thead><tr><th>File</th><th>Version</th><th>Last edited</th><th>Status</th></tr></thead>
+      <tbody>${rows}</tbody>
+    </table>`;
+}
+
+function renderFilesEmpty() {
+  $("#filesPane").innerHTML = emptyState("Pick a project", "Its backed-up files, versions and status show here.");
+}
+
+/* ---------- one file ---------- */
+
+function renderDetailEmpty() {
+  $("#detailPane").innerHTML = emptyState("Pick a file", "See its versions, view or compare them, download any version, or restore it to the project.");
+}
+
+async function selectFile(path, keepReveal) {
+  S.file = path;
+  setHash();
+  if (!keepReveal) S.reveal = false;
+  document.querySelectorAll("#filesPane tr[data-path]").forEach(tr => tr.classList.toggle("sel", tr.dataset.path === path));
+  const pane = $("#detailPane");
+  pane.innerHTML = `<div class="loading">Loading…</div>`;
+  try {
+    S.fileData = await api("/api/file?path=" + enc(path));
+  } catch (e) {
+    pane.innerHTML = `<div class="error">${esc(e.message)}</div>`;
+    return;
+  }
+  S.previewV = S.fileData.version;
+  S.previewText = null;
+  S.diff = null;
+  renderDetail();
+  if (S.fileData.text) loadPreview(S.previewV);
+}
+
+function renderDetail() {
+  const f = S.fileData;
+  const vrows = [...f.versions].reverse().map(v =>
+    `<tr><td class="nowrap"><span class="ver">v${v.v}</span>${v.current ? `<span class="tag">current</span>` : ""}</td>` +
+    `<td class="muted nowrap">${esc(v.edited)}</td><td class="muted nowrap">${size(v.size)}</td>` +
+    `<td class="right nowrap"><a class="link" href="${dl(f.path, v.v)}" download>Download</a>` +
+    (f.text ? `<button class="link" data-act="view" data-v="${v.v}">View</button>` : "") +
+    `<button class="link" data-act="restore-version" data-v="${v.v}">Restore</button></td></tr>`).join("");
+  const opts = sel => [...f.versions].map(v => `<option value="${v.v}" ${v.v === sel ? "selected" : ""}>v${v.v}${v.current ? " (current)" : ""}</option>`).join("");
+  const pre = f.preRestore.length ? `<p class="muted small" style="margin:10px 0 0">Saved before a restore: ${f.preRestore.map(p => `<span class="mono">${esc(p.name)}</span>`).join(", ")}</p>` : "";
+  let content;
+  if (!f.text) {
+    content = `<div class="section"><h3>Content</h3><p class="muted" style="margin:8px 0 0">Binary file (for example a keystore). Download it to use it.</p></div>`;
+  } else {
+    content = `
+      <div class="section">
+        <div class="section-head">
+          <h3>Content <span class="ver" id="pv">v${S.previewV}</span></h3>
+          <label class="toggle"><input type="checkbox" id="reveal" ${S.reveal ? "checked" : ""}> ${f.kv ? "Show values" : "Show content"}</label>
+        </div>
+        <pre class="code" id="preview"><span class="hidden-note">Loading…</span></pre>
+      </div>` +
+      (f.versions.length > 1 ? `
+      <div class="section">
+        <div class="section-head"><h3>Compare versions</h3></div>
+        <div class="row">
+          <select id="cmpA" aria-label="Older version">${opts(f.version - 1)}</select>
+          <span class="muted">to</span>
+          <select id="cmpB" aria-label="Newer version">${opts(f.version)}</select>
+          <button class="btn" data-act="compare">Compare</button>
+        </div>
+        <pre class="code diff" id="diff" style="margin-top:10px" hidden></pre>
+      </div>` : "");
+  }
+  $("#detailPane").innerHTML = `
+    <div class="pane-head">
+      <div class="eyebrow">File</div>
+      <h2 class="mono" style="font-size:16px">${esc(f.name)}</h2>
+      <div class="path mono">${esc(tilde(f.source))}</div>
+      <div class="note">${chip(f.status)}<span>${esc(EXPLAIN[f.status] || "")}</span></div>
+      <div class="btns">
+        <a class="btn primary" href="${dl(f.path)}" download>Download</a>
+        <button class="btn" data-act="restore-file">Restore to project</button>
+        <button class="btn" data-act="finder-file">Show in Finder</button>
+      </div>
+    </div>
+    <div class="section">
+      <div class="section-head"><h3>Versions <span class="muted">(${f.versions.length})</span></h3></div>
+      <table class="tbl"><thead><tr><th>Version</th><th>Last edited</th><th>Size</th><th></th></tr></thead><tbody>${vrows}</tbody></table>
+      ${pre}
+    </div>
+    ${content}`;
+}
+
+const KV_RE = /^(\s*#?\s*(?:export\s+)?[A-Za-z_][\w.\-]*\s*[=:]\s*)(.*)$/;
+function maskLine(line) {
+  const m = line.match(KV_RE);
+  if (!m) return esc(line);
+  return esc(m[1]) + (m[2].trim().length ? `<span class="mask">••••••••</span>` : "");
+}
+function renderPreview() {
+  const el = $("#preview");
+  if (!el || S.previewText == null) return;
+  $("#pv").textContent = "v" + S.previewV;
+  const kv = S.fileData.kv, text = S.previewText;
+  if (S.reveal) {
+    el.innerHTML = text.split("\n").map(l => `<span class="line">${esc(l)}</span>`).join("");
+  } else if (kv) {
+    el.innerHTML = text.split("\n").map(l => `<span class="line">${maskLine(l)}</span>`).join("");
+  } else {
+    const n = text.split("\n").length;
+    el.innerHTML = `<span class="hidden-note">Hidden (${n} lines). Turn on “Show content” to see it.</span>`;
+  }
+}
+async function loadPreview(v) {
+  S.previewV = v;
+  const path = S.file;
+  try {
+    const r = await api("/api/preview?path=" + enc(path) + "&v=" + v);
+    if (S.file !== path) return;
+    S.previewText = r.text;
+    renderPreview();
+  } catch (e) {
+    const el = $("#preview");
+    if (el) el.innerHTML = `<span class="hidden-note">${esc(e.message)}</span>`;
+  }
+}
+function renderDiff() {
+  const el = $("#diff");
+  if (!el || !S.diff) return;
+  el.hidden = false;
+  const kv = S.fileData.kv, lines = S.diff.lines;
+  if (!lines.length) { el.innerHTML = `<span class="hidden-note">These versions are identical.</span>`; return; }
+  if (!S.reveal && !kv) {
+    const add = lines.filter(l => l[0] === "+" && !l.startsWith("+++")).length;
+    const del = lines.filter(l => l[0] === "-" && !l.startsWith("---")).length;
+    el.innerHTML = `<span class="hidden-note">${add} line(s) added, ${del} removed. Turn on “Show content” to see them.</span>`;
+    return;
+  }
+  el.innerHTML = lines.map(l => {
+    let cls = "", body;
+    if (l.startsWith("+++") || l.startsWith("---")) { cls = "hunk"; body = esc(l); }
+    else if (l.startsWith("@@")) { cls = "hunk"; body = esc(l); }
+    else {
+      cls = l[0] === "+" ? "add" : l[0] === "-" ? "del" : "";
+      body = esc(l[0] || " ") + (S.reveal ? esc(l.slice(1)) : maskLine(l.slice(1)));
+    }
+    return `<span class="line ${cls}">${body}</span>`;
+  }).join("");
+}
+async function compare() {
+  const a = +$("#cmpA").value, b = +$("#cmpB").value;
+  try {
+    S.diff = await api(`/api/diff?path=${enc(S.file)}&a=${a}&b=${b}`);
+    renderDiff();
+  } catch (e) { toast(e.message, true); }
+}
+
+/* ---------- actions ---------- */
+
+async function refreshAll() {
+  await loadSummary().catch(() => {});
+  if (S.project) await selectProject(S.project, true);
+  if (S.file) await selectFile(S.file, true);
+}
+
+async function restore(body, question) {
+  if (!confirm(question)) return;
+  try {
+    const r = await api("/api/restore", body);
+    showOutput(r.ok ? "Restored" : "Restore had problems", r.output);
+  } catch (e) { toast(e.message, true); }
+  await refreshAll();
+}
+
+async function openIn(what, path) {
+  try { await api("/api/open", { what, path }); } catch (e) { toast(e.message, true); }
+}
+
+async function doSync() {
+  const b = $("#btnSync");
+  b.disabled = true;
+  b.textContent = "Syncing…";
+  try {
+    const r = await api("/api/sync", {});
+    const lines = (r.output || "").trim().split("\n").filter(Boolean);
+    const last = lines.length ? lines[lines.length - 1].replace(/^\d{4}-\d\d-\d\d \d\d:\d\d:\d\d\s+/, "") : "Sync finished";
+    if (!r.ok) showOutput("Sync failed", r.output);
+    else if (lines.length > 1) showOutput("Sync finished", r.output);
+    else toast("Sync finished: " + last);
+  } catch (e) { toast(e.message, true); }
+  b.disabled = false;
+  b.textContent = "Sync now";
+  await refreshAll();
+}
+
+/* ---------- add files dialog ---------- */
+
+const A = { path: "", items: [], selected: new Set(), canAddFolder: false, folderInExtras: false };
+function parentOf(p) { const i = p.lastIndexOf("/"); return i < 0 ? "" : p.slice(0, i); }
+
+async function openAdd(start) {
+  $("#candFilter").value = "";
+  $("#addDialog").showModal();
+  await browse(start || "");
+}
+
+async function browse(path) {
+  A.path = path; A.items = []; A.selected.clear(); A.canAddFolder = false; A.folderInExtras = false;
+  const parts = path ? path.split("/") : [];
+  $("#crumbs").innerHTML = `<button class="link" data-dir="">${esc(rootName())}</button>` +
+    parts.map((p, i) => ` / <button class="link" data-dir="${esc(parts.slice(0, i + 1).join("/"))}">${esc(p)}</button>`).join("");
+  $("#dirList").innerHTML = `<li class="empty">Loading…</li>`;
+  $("#candList").innerHTML = "";
+  $("#candNote").textContent = "";
+  updateAddButtons();
+  try {
+    const b = await api("/api/browse?path=" + enc(path));
+    if (A.path !== path) return;
+    $("#dirList").innerHTML = (path ? `<li><button class="dir" data-dir="${esc(parentOf(path))}"><span class="cname muted">← Up one level</span></button></li>` : "") +
+      (b.dirs.length ? b.dirs.map(d => `<li><button class="dir" data-dir="${esc(d.path)}"><span class="cname">${esc(d.name)}</span>${d.git ? `<span class="badge">git</span>` : ""}</button></li>`).join("")
+        : `<li class="empty">No subfolders.</li>`);
+  } catch (e) { $("#dirList").innerHTML = `<li class="empty">${esc(e.message)}</li>`; }
+  if (!path) {
+    $("#candList").innerHTML = `<li class="empty">Open a project folder on the left to see the files git does not track in it.</li>`;
+    return;
+  }
+  $("#candList").innerHTML = `<li class="empty">Looking for files git does not track…</li>`;
+  try {
+    const c = await api("/api/candidates?path=" + enc(path));
+    if (A.path !== path) return;
+    A.items = c.items; A.canAddFolder = c.canAddFolder; A.folderInExtras = c.folderInExtras;
+    renderCands();
+    $("#candNote").textContent = (c.repo
+      ? `In git repo ${c.repo}. Files git tracks are already safe in git, so only untracked and ignored ones are listed.`
+      : "Not in a git repo, so every file here is listed.") + (c.truncated ? ` Showing the first ${c.items.length}.` : "");
+  } catch (e) { $("#candList").innerHTML = `<li class="empty">${esc(e.message)}</li>`; }
+  updateAddButtons();
+}
+
+function renderCands() {
+  const term = $("#candFilter").value.trim().toLowerCase();
+  const items = A.items.filter(i => !term || i.name.toLowerCase().includes(term));
+  if (!items.length) {
+    $("#candList").innerHTML = `<li class="empty">${A.items.length ? "No files match the filter." : "Nothing here that git does not track."}</li>`;
+    return;
+  }
+  $("#candList").innerHTML = items.map(i => {
+    const locked = i.inVault || i.inExtras || i.auto;
+    const badge = i.inVault ? `<span class="badge ok">In vault</span>` : i.inExtras ? `<span class="badge">On manual list</span>`
+      : i.auto ? `<span class="badge" title="Picked up by the next sync">Automatic</span>` : "";
+    return `<li class="${locked ? "locked" : ""}"><label><input type="checkbox" data-cand="${esc(i.path)}" ${locked || A.selected.has(i.path) ? "checked" : ""} ${locked ? "disabled" : ""}>` +
+      `<span class="cname mono" title="${esc(i.name)}">${esc(i.name)}</span></label>` +
+      (i.dir ? `<span class="badge">folder</span>` : `<span class="muted small nowrap">${size(i.size)}</span>`) + badge + `</li>`;
+  }).join("");
+}
+
+function updateAddButtons() {
+  const n = A.selected.size, b = $("#addConfirm"), f = $("#addFolder");
+  b.disabled = !n;
+  b.textContent = n ? `Add ${n} selected` : "Add selected";
+  f.disabled = !A.path || !A.canAddFolder || A.folderInExtras;
+  f.title = !A.path ? "Open a folder first" : !A.canAddFolder ? "This folder is in a git repo: pick the files it needs instead"
+    : A.folderInExtras ? "Already on the manual list" : "Back up every file in this folder";
+}
+
+async function addPaths(paths) {
+  const b = $("#addConfirm"), f = $("#addFolder");
+  b.disabled = f.disabled = true;
+  b.textContent = "Adding…";
+  try {
+    const r = await api("/api/extras/add", { paths });
+    $("#addDialog").close();
+    showOutput(r.added.length ? `Added ${r.added.length} to the vault` : "Already on the manual list", r.output);
+    await refreshAll();
+    if ($("#extrasDialog").open) loadExtras();
+  } catch (e) { toast(e.message, true); }
+  updateAddButtons();
+}
+
+/* ---------- manual list dialog ---------- */
+
+async function loadExtras() {
+  const list = $("#extrasList");
+  try {
+    const r = await api("/api/extras");
+    list.innerHTML = r.entries.length ? r.entries.map(e =>
+      `<li><span class="cname mono" title="${esc(e.path)}">${esc(e.path)}${e.dir ? "/" : ""}</span>` +
+      (e.exists ? "" : `<span class="badge bad">not found</span>`) +
+      `<button class="link" data-remove="${esc(e.path)}">Remove</button></li>`).join("")
+      : `<li class="empty">Nothing on the manual list.</li>`;
+  } catch (e) { list.innerHTML = `<li class="empty">${esc(e.message)}</li>`; }
+}
+
+/* ---------- wiring ---------- */
+
+$("#btnSync").addEventListener("click", doSync);
+$("#btnAdd").addEventListener("click", () => openAdd(S.projectData && !S.projectData.isGroup ? S.projectData.name : ""));
+$("#btnExtras").addEventListener("click", () => { $("#extrasDialog").showModal(); loadExtras(); });
+$("#btnFinder").addEventListener("click", () => openIn("vault"));
+$("#btnQuit").addEventListener("click", async () => {
+  if (!confirm("Stop Project Vault? Background backups keep running.")) return;
+  try { await api("/api/quit", {}); } catch (e) { /* already stopping */ }
+  showStopped("Project Vault stopped", "You can close this tab. Background backups keep running.");
+});
+
+document.addEventListener("click", e => {
+  const f = e.target.closest("[data-filter]");
+  if (f && !e.target.closest("dialog")) {
+    S.filter = S.filter === f.dataset.filter && f.classList.contains("pill") ? "all" : f.dataset.filter;
+    renderHeader(); renderProjects();
+  }
+});
+$("#subline").addEventListener("click", async e => {
+  const b = e.target.closest("#offsiteNow");
+  if (!b) return;
+  b.disabled = true;
+  b.textContent = "Copying…";
+  try {
+    const r = await api("/api/offsite", {});
+    if (r.ok) toast("Encrypted copy saved and checked"); else showOutput("Encrypted copy failed", r.output);
+  } catch (err) { toast(err.message, true); }
+  await loadSummary().catch(() => {});
+});
+$("#search").addEventListener("input", e => {
+  S.search = e.target.value;
+  renderProjects();
+  if (S.projectData) renderFiles();
+});
+$("#projectList").addEventListener("click", e => {
+  const b = e.target.closest("button.proj");
+  if (b) selectProject(b.dataset.name);
+});
+
+$("#filesPane").addEventListener("click", e => {
+  const act = e.target.closest("[data-act]");
+  if (act) {
+    const p = S.projectData;
+    if (act.dataset.act === "restore-project") {
+      restore({ project: p.name }, `Copy all ${p.files.length} vault files of ${p.name} back into the project?\n\n${tilde(p.source)}\n\nMissing files are created. Files that differ are first saved in the vault history, then replaced.`);
+    } else if (act.dataset.act === "finder-project") {
+      openIn("source", p.isGroup ? "" : p.name);
+    } else if (act.dataset.act === "add-here") {
+      openAdd(p.name);
+    }
+    return;
+  }
+  const tr = e.target.closest("tr[data-path]");
+  if (tr) selectFile(tr.dataset.path);
+});
+$("#filesPane").addEventListener("keydown", e => {
+  const tr = e.target.closest("tr[data-path]");
+  if (!tr) return;
+  if (e.key === "Enter" || e.key === " ") { e.preventDefault(); selectFile(tr.dataset.path); }
+  if (e.key === "ArrowDown" && tr.nextElementSibling) { e.preventDefault(); tr.nextElementSibling.focus(); }
+  if (e.key === "ArrowUp" && tr.previousElementSibling) { e.preventDefault(); tr.previousElementSibling.focus(); }
+});
+
+$("#detailPane").addEventListener("click", e => {
+  const act = e.target.closest("[data-act]");
+  if (!act) return;
+  const f = S.fileData, v = act.dataset.v ? +act.dataset.v : null;
+  switch (act.dataset.act) {
+    case "view":
+      loadPreview(v);
+      $("#preview").scrollIntoView({ behavior: "smooth", block: "nearest" });
+      break;
+    case "compare": compare(); break;
+    case "finder-file": openIn(f.status === "missing" ? "vaultfile" : "source", f.path); break;
+    case "restore-file":
+      restore({ path: f.path }, `Put the vault copy of ${f.name} (v${f.version}) back into the project?\n\n${tilde(f.source)}\n\nIf the project has a different copy, it is first saved in the vault history.`);
+      break;
+    case "restore-version":
+      restore({ path: f.path, version: v }, `Put version v${v} of ${f.name} back into the project?\n\n${tilde(f.source)}\n\nIf the project has a different copy, it is first saved in the vault history.` +
+        (v !== f.version ? " The next sync saves the restored content as a new version." : ""));
+      break;
+  }
+});
+$("#detailPane").addEventListener("change", e => {
+  if (e.target.id === "reveal") { S.reveal = e.target.checked; renderPreview(); renderDiff(); }
+});
+
+$("#addDialog").addEventListener("click", e => {
+  const d = e.target.closest("[data-dir]");
+  if (d) browse(d.dataset.dir);
+});
+$("#candList").addEventListener("change", e => {
+  const c = e.target.closest("[data-cand]");
+  if (!c) return;
+  if (c.checked) A.selected.add(c.dataset.cand); else A.selected.delete(c.dataset.cand);
+  updateAddButtons();
+});
+$("#candFilter").addEventListener("input", renderCands);
+$("#addCancel").addEventListener("click", () => $("#addDialog").close());
+$("#addConfirm").addEventListener("click", () => addPaths([...A.selected]));
+$("#addFolder").addEventListener("click", () => {
+  if (confirm(`Back up every file in ${A.path}?\n\nNew files added to this folder later are backed up too.`)) addPaths([A.path]);
+});
+
+$("#extrasList").addEventListener("click", async e => {
+  const b = e.target.closest("[data-remove]");
+  if (!b) return;
+  if (!confirm(`Stop backing up ${b.dataset.remove}?\n\nCopies already in the vault are kept.`)) return;
+  try { await api("/api/extras/remove", { path: b.dataset.remove }); toast("Removed from the manual list"); }
+  catch (err) { toast(err.message, true); }
+  loadExtras();
+  refreshAll();
+});
+$("#extrasClose").addEventListener("click", () => $("#extrasDialog").close());
+$("#extrasAdd").addEventListener("click", () => { $("#extrasDialog").close(); $("#btnAdd").click(); });
+$("#outClose").addEventListener("click", () => $("#outDialog").close());
+
+renderFilesEmpty();
+renderDetailEmpty();
+loadSummary().then(async () => {
+  const h = new URLSearchParams(location.hash.slice(1));
+  if (h.get("project")) await selectProject(h.get("project"));
+  if (h.get("file")) await selectFile(h.get("file"));
+  if (h.has("add")) openAdd(h.get("add"));
+}).catch(e => { $("#projectList").innerHTML = `<li class="empty">${esc(e.message)}</li>`; });
+setInterval(() => { if (!stopped) loadSummary().catch(() => {}); }, 60000);
+</script>
+</body>
+</html>

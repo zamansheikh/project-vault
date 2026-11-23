@@ -1,0 +1,12 @@
+# Never commit a real vault or anything from one.
+_ProjectVault/
+*.dmg
+offsite.conf
+.env
+.env.*
+
+# macOS and build leftovers
+.DS_Store
+src/ProjectVaultAgent
+__pycache__/
+*.pyc

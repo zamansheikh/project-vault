@@ -1,0 +1,731 @@
+#!/bin/zsh
+# Project Vault: keeps a versioned backup of the gitignored files your projects
+# need to run (.env files, Firebase configs, signing keys) in one folder, and an
+# encrypted copy of it off your Mac.  https://github.com/zamansheikh/project-vault
+# Run `vault help` for the commands.
+
+emulate -R zsh
+setopt extended_glob pipe_fail
+umask 077
+# BSD tools first: the script relies on macOS stat/cp/diff flags.
+export PATH="/usr/bin:/bin:/usr/sbin:/sbin:$PATH"
+
+VERSION="1.0.0"
+APP_DIR="${0:A:h}"
+# Written by install.sh: ROOT (the folder that holds your projects) and VAULT.
+CONFIG="${VAULT_CONFIG:-$HOME/Library/Application Support/ProjectVault/config}"
+typeset CFG_ROOT="" CFG_VAULT=""
+if [[ -f $CONFIG ]]; then
+  while IFS='=' read -r _k _v || [[ -n $_k ]]; do
+    case $_k in
+      ROOT)  CFG_ROOT="${_v/#\~/$HOME}" ;;
+      VAULT) CFG_VAULT="${_v/#\~/$HOME}" ;;
+    esac
+  done < "$CONFIG"
+fi
+ROOT="${VAULT_ROOT:-${CFG_ROOT:-$HOME/Documents}}"
+ROOT="${ROOT%/}"
+VAULT="${VAULT_DIR:-${CFG_VAULT:-$ROOT/_ProjectVault}}"
+CUR="$VAULT/current"
+HIST="$VAULT/history"
+STATE="$VAULT/.state"
+LOGDIR="$VAULT/logs"
+LOG="$LOGDIR/changes.log"
+EXTRAS="$VAULT/extras.txt"
+EXCLUDES="$VAULT/exclude.txt"
+INDEX_MD="$VAULT/INDEX.md"
+MAX_BYTES=$(( 50 * 1024 * 1024 ))   # bigger files are skipped and reported
+
+# File names picked up automatically when git does not track them.
+MATCH_NAMES=(
+  '.env' '.env.*' '*.env' '.dev.vars' '.npmrc' '*.tfvars'
+  'google-services.json' 'GoogleService-Info.plist' 'firebase_options.dart'
+  '*firebase-adminsdk*.json' 'serviceAccount*.json' 'service-account*.json'
+  '.runtimeconfig.json' 'credentials*.json' 'secrets*'
+  'key.properties' 'keystore.properties' '*.jks' '*.keystore'
+  '*.p8' '*.p12' '*.pem' '*.mobileprovision'
+)
+# Templates and machine-generated files that need no backup.
+SKIP_NAMES=( '*.example' '*.sample' '*.template' '*.dist' 'local.properties' )
+# Folders never searched: dependencies, build output, caches, worktree copies.
+PRUNE_NAMES=(
+  node_modules .git build Pods .dart_tool .gradle .next dist .venv venv
+  Library Temp .expo DerivedData .pub-cache ephemeral .symlinks .cxx .turbo
+  .cache .wrangler .svelte-kit __pycache__ .claude .worktrees
+)
+
+QUIET=0
+typeset -A FOUND        # relative path -> project it belongs to
+typeset -A TOPCACHE     # directory -> git top level ("" when not in a repo)
+typeset -a EXCLUDE_LIST
+
+say()     { (( QUIET )) || print -r -- "$*" }
+warn()    { print -r -- "vault: $*" >&2 }
+now()     { date '+%Y-%m-%d %H:%M:%S' }
+logline() { mkdir -p "$LOGDIR"; print -r -- "$(now)  $*" >> "$LOG" }
+
+# Non-blank, non-comment lines of a list file, as paths relative to ROOT.
+read_list() {
+  [[ -f $1 ]] || return 0
+  local line
+  while IFS= read -r line || [[ -n $line ]]; do
+    line="${line##[[:space:]]#}"; line="${line%%[[:space:]]#}"
+    [[ -z $line || $line == \#* ]] && continue
+    line="${line%/}"; line="${line#$ROOT/}"
+    print -r -- "$line"
+  done < "$1"
+}
+
+is_excluded() {
+  local e
+  for e in $EXCLUDE_LIST; do [[ $1 == "$e" || $1 == "$e/"* ]] && return 0; done
+  return 1
+}
+
+# Project of a file outside any git repo: the first two folders of its path.
+guess_project() {
+  local d="${1:h}"
+  [[ $d == . ]] && { print -r -- "(top level)"; return }
+  local -a parts; parts=( ${(s:/:)d} )
+  if (( ${#parts} >= 2 )); then print -r -- "${parts[1]}/${parts[2]}"; else print -r -- "${parts[1]}"; fi
+}
+
+git_top() {   # cached git top level of a directory
+  local d=$1
+  if [[ -z ${TOPCACHE[$d]+x} ]]; then
+    TOPCACHE[$d]="$(git -C "$d" rev-parse --show-toplevel 2>/dev/null)"
+  fi
+  print -r -- "${TOPCACHE[$d]}"
+}
+
+project_for() {   # $1 = relative path; works even when the source is gone
+  local d="$ROOT/${1:h}" top
+  while [[ ! -d $d && $d != "$ROOT" ]]; do d="${d:h}"; done
+  top="$(git_top "$d")"
+  if [[ -n $top && $top != "$ROOT" && $top == "$ROOT/"* ]]; then print -r -- "${top#$ROOT/}"
+  else guess_project "$1"; fi
+}
+
+# Highest version number of a file: versions in history/ + the current copy.
+current_version() {
+  local rel=$1 base="${1:t}" f v max=0
+  for f in "$HIST/${rel:h}"/${(b)base}.v<->_*(N); do
+    v="${${f:t}#${base}.v}"; v="${v%%_*}"
+    (( v > max )) && max=$v
+  done
+  print $(( max + 1 ))
+}
+
+version_path() {   # $1 rel, $2 version number -> file holding that version
+  local rel=$1 n=${2#v} base="${1:t}" cv
+  cv=$(current_version "$rel")
+  if (( n == cv )); then print -r -- "$CUR/$rel"; return; fi
+  local -a m; m=( "$HIST/${rel:h}"/${(b)base}.v${n}_*(N) )
+  (( ${#m} )) || { warn "no version v$n of $rel (current is v$cv; see: vault history $rel)"; return 1 }
+  print -r -- "${m[1]}"
+}
+
+# Turn a user-given path (relative to the projects folder, absolute, or relative
+# to the current folder) into a path relative to the projects folder.
+resolve_target() {
+  local p="${1%/}"
+  if [[ $p == /* ]]; then
+    p="${p#$CUR/}"
+  elif [[ $p == (.|..|./*|../*) || ( ! -e "$CUR/$p" && -e $p ) ]]; then
+    p="${p:a}"
+  fi
+  [[ $p == "$ROOT" ]] && p=""
+  if [[ $p == /* ]]; then
+    [[ $p == "$ROOT/"* ]] || { warn "not inside $ROOT: $1"; return 1 }
+    p="${p#$ROOT/}"
+  fi
+  [[ -n $p && $p != . ]] || { warn "give a project folder or a file, e.g. acme/shop-backend or acme/shop-backend/.env"; return 1 }
+  print -r -- "$p"
+}
+
+# Fill FOUND with every file that should be in the vault.
+discover() {
+  FOUND=()
+  EXCLUDE_LIST=( ${(f)"$(read_list "$EXCLUDES")"} )
+  local -a prune names skip
+  local n p f rel top
+  for n in $PRUNE_NAMES; do prune+=( -name "$n" -o ); done
+  prune+=( -path "$VAULT" )
+  for p in $EXCLUDE_LIST; do prune+=( -o -path "$ROOT/$p" ); done
+  for n in $MATCH_NAMES; do names+=( -name "$n" -o ); done; names[-1]=()
+  for n in $SKIP_NAMES;  do skip+=( -name "$n" -o );  done; skip[-1]=()
+
+  while IFS= read -r -d '' f; do
+    rel="${f#$ROOT/}"
+    top="$(git_top "${f:h}")"
+    if [[ -n $top ]]; then
+      # Tracked files are already safe in git.
+      git -C "${f:h}" ls-files --error-unmatch -- "${f:t}" >/dev/null 2>&1 && continue
+    fi
+    FOUND[$rel]="$(project_for "$rel")"
+  done < <(find "$ROOT" \( "${prune[@]}" \) -prune -o -type f \( "${names[@]}" \) ! \( "${skip[@]}" \) -print0 2>/dev/null)
+
+  # Extra files and folders listed by hand.
+  local x
+  for x in ${(f)"$(read_list "$EXTRAS")"}; do
+    if [[ -d "$ROOT/$x" ]]; then
+      while IFS= read -r -d '' f; do
+        rel="${f#$ROOT/}"
+        is_excluded "$rel" && continue
+        [[ -n ${FOUND[$rel]+x} ]] || FOUND[$rel]="$(project_for "$rel")"
+      done < <(find "$ROOT/$x" \( "${prune[@]}" \) -prune -o -type f ! -name .DS_Store -print0 2>/dev/null)
+    elif [[ -f "$ROOT/$x" ]]; then
+      is_excluded "$x" || [[ -n ${FOUND[$x]+x} ]] || FOUND[$x]="$(project_for "$x")"
+    elif [[ ! -e "$CUR/$x" ]]; then
+      warn "extras.txt entry not found: $x"
+    fi
+  done
+}
+
+# Back up new and changed files. With $1 = 1, only report (vault status).
+cmd_sync() {
+  local dry=${1:-0}
+  if ! ls "$ROOT" >/dev/null 2>&1; then
+    warn "cannot read $ROOT. If this runs in the background, macOS has not given it access yet (System Settings > Privacy & Security > Full Disk Access: add ~/Library/Application Support/ProjectVault/ProjectVaultAgent)."
+    return 1
+  fi
+  mkdir -p "$CUR" "$HIST" "$STATE" "$LOGDIR" && chmod 700 "$VAULT"
+  discover
+  local -a cur_files; cur_files=( "$CUR"/**/^.DS_Store(.DN) )
+  if (( ${#FOUND} == 0 && ${#cur_files} > 0 )); then
+    warn "found no files to back up although the vault has ${#cur_files}; stopping so nothing is marked missing by mistake"
+    return 1
+  fi
+
+  local rel src cur n stamp hist size
+  local -i added=0 changed=0 big=0
+  for rel in ${(ok)FOUND}; do
+    src="$ROOT/$rel"; cur="$CUR/$rel"
+    size=$(stat -f %z "$src" 2>/dev/null) || continue
+    if (( size > MAX_BYTES )); then (( big++ )); warn "skipped, over 50 MB: $rel"; continue; fi
+    if [[ ! -e $cur ]]; then
+      (( added++ ))
+      n=$(current_version "$rel")
+      if (( dry )); then print -r -- "NEW       $rel"; continue; fi
+      mkdir -p "${cur:h}" && cp -p "$src" "$cur" || { warn "copy failed: $rel"; continue }
+      logline "ADDED    v$n  $rel"; say "added    v$n  $rel"
+    elif ! cmp -s "$src" "$cur"; then
+      (( changed++ ))
+      n=$(current_version "$rel")
+      if (( dry )); then print -r -- "CHANGED   $rel  (v$n -> v$(( n + 1 )))"; continue; fi
+      stamp=$(stat -f %Sm -t %Y-%m-%d_%H%M "$cur")
+      hist="$HIST/$rel.v${n}_$stamp"
+      mkdir -p "${hist:h}" && mv "$cur" "$hist" && cp -p "$src" "$cur" || { warn "update failed: $rel"; continue }
+      logline "CHANGED  v$(( n + 1 ))  $rel  (old: history/${hist#$HIST/})"
+      say "changed  v$(( n + 1 ))  $rel  (old copy: history/${hist#$HIST/})"
+    fi
+  done
+
+  local -a missing
+  for cur in "$CUR"/**/^.DS_Store(.DN); do
+    rel="${cur#$CUR/}"
+    [[ -n ${FOUND[$rel]+x} || -e "$ROOT/$rel" ]] || missing+=( "$rel" )
+  done
+
+  local summary="added $added, changed $changed, source missing ${#missing}, total ${#FOUND}"
+  if (( dry )); then
+    for rel in $missing; do print -r -- "MISSING   $rel  (still safe in the vault)"; done
+    (( added + changed )) || print -r -- "Everything is backed up."
+    [[ -f "$STATE/last-sync" ]] && print -r -- "Last sync: $(<"$STATE/last-sync")"
+    return 0
+  fi
+  write_index
+  print -r -- "$(now)  $summary" > "$STATE/last-sync"
+  if (( added + changed )) || (( ! QUIET )); then print -r -- "$(now)  $summary"; fi
+  offsite_if_due
+  return 0
+}
+
+# ---------- off-disk encrypted copies ----------
+# offsite.conf holds DEST=<folder> (and optionally KEEP=<how many copies>).
+# The password lives in the macOS Keychain, never in a file.
+OFFSITE_CONF="$VAULT/offsite.conf"
+KC_SERVICE="${VAULT_KC_SERVICE:-Project Vault backup}"
+
+offsite_setting() {   # $1 = key; prints its value from offsite.conf
+  local line
+  [[ -f $OFFSITE_CONF ]] || return 1
+  while IFS= read -r line || [[ -n $line ]]; do
+    [[ $line == "$1="* ]] && { print -r -- "${line#$1=}"; return 0 }
+  done < "$OFFSITE_CONF"
+  return 1
+}
+
+offsite_dest() {
+  if [[ -n $VAULT_OFFSITE_DEST ]]; then print -r -- "$VAULT_OFFSITE_DEST"; return 0; fi
+  local d; d=$(offsite_setting DEST) || return 1
+  print -r -- "${d/#\~/$HOME}"
+}
+
+# Due when there is no copy yet, the last one is a week old, or the vault
+# changed since the last one and that one is at least a day old.
+offsite_due() {
+  offsite_dest >/dev/null || return 1
+  local last="$STATE/last-offsite"
+  [[ -f $last ]] || return 0
+  [[ -n $(find "$last" -mmin +$(( 7 * 24 * 60 )) 2>/dev/null) ]] && return 0
+  [[ -n $(find "$last" -mmin +$(( 24 * 60 )) 2>/dev/null) && $LOG -nt $last ]] && return 0
+  return 1
+}
+
+offsite_if_due() {
+  offsite_due || return 0
+  local att="$STATE/offsite-attempt"
+  # After a failure, try again at most every 6 hours instead of every sync.
+  [[ -f $att && -n $(find "$att" -mmin -360 2>/dev/null) ]] && return 0
+  touch "$att"
+  cmd_offsite_now && rm -f "$att"
+  return 0
+}
+
+# Make one encrypted (AES-256) .dmg of the whole vault, open it to check every
+# file matches, then copy it to the destination.
+cmd_offsite_now() {
+  local dest; dest=$(offsite_dest) || { warn "off-disk copies are not set up (no offsite.conf)"; return 1 }
+  local pw; pw=$(security find-generic-password -s "$KC_SERVICE" -a "$USER" -w ${VAULT_KEYCHAIN:+"$VAULT_KEYCHAIN"} 2>/dev/null) || {
+    warn "the backup password is not in the Keychain (item \"$KC_SERVICE\"); set it with: vault offsite setup"; return 1 }
+  local work; work=$(mktemp -d "${TMPDIR:-/tmp}/projectvault.XXXXXX") || { pw=""; return 1 }
+  local stamp; stamp=$(date +%Y-%m-%d_%H%M%S)
+  local name="ProjectVault-$stamp.dmg"
+  local stage="$work/stage" img="$work/$name" mnt="$work/mnt" ok=0
+  mkdir -p "$stage" "$mnt"
+  if rsync -a --exclude '.state/ui.json' --exclude '.state/sync.lock' --exclude '.state/offsite-attempt' \
+       --exclude '.DS_Store' "$VAULT/" "$stage/_ProjectVault/"; then
+    cat > "$stage/HOW TO RESTORE.txt" <<EOF
+Project Vault encrypted copy, made $(now).
+
+Your projects folder when this copy was made: $ROOT
+
+Every file is in _ProjectVault/current/, at the same path it had inside that
+folder. To take one or two files, just copy them out.
+
+To put everything back on a new Mac:
+1. Copy the _ProjectVault folder to $VAULT
+2. Install Project Vault: https://github.com/zamansheikh/project-vault
+   (git clone, then ./install.sh --root "$ROOT")
+3. Clone your projects again, then run:  vault restore <project folder>
+
+_ProjectVault/README.md explains the layout.
+EOF
+    if printf '%s' "$pw" | hdiutil create -quiet -srcfolder "$stage" -volname "ProjectVault $stamp" \
+         -fs APFS -format UDZO -encryption AES-256 -stdinpass "$img" \
+       && printf '%s' "$pw" | hdiutil attach -quiet -nobrowse -noautoopen -readonly -stdinpass -mountpoint "$mnt" "$img"; then
+      diff -rq -x .fseventsd -x .Trashes -x .Spotlight-V100 -x .DS_Store "$stage" "$mnt" >/dev/null && ok=1
+      hdiutil detach -quiet "$mnt" 2>/dev/null || hdiutil detach -quiet -force "$mnt" 2>/dev/null
+    fi
+  fi
+  pw=""
+  if (( ! ok )); then
+    warn "could not make or check the encrypted copy; nothing was copied"
+    rm -rf "$work"; return 1
+  fi
+  if ! { mkdir -p "$dest" && cp "$img" "$dest/$name.partial" && mv "$dest/$name.partial" "$dest/$name"; }; then
+    warn "could not write to $dest (if it is iCloud Drive or another protected folder, add ~/Library/Application Support/ProjectVault/ProjectVaultAgent under System Settings > Privacy & Security > Full Disk Access)"
+    rm -f "$dest/$name.partial" 2>/dev/null; rm -rf "$work"; return 1
+  fi
+  local size; size=$(stat -f %z "$dest/$name")
+  rm -rf "$work"
+  logline "OFFSITE  $name  ($size bytes, checked)  -> $dest"
+  # Every copy holds the full history, so only the newest few are kept.
+  local keep; keep=$(offsite_setting KEEP) || keep=12
+  local -a all; all=( "$dest"/ProjectVault-*.dmg(Nom) )
+  local old
+  for old in ${all[keep+1,-1]}; do
+    rm -f "$old" && logline "OFFSITE  removed old copy ${old:t}"
+  done
+  # Written last, so the log lines above do not count as a change.
+  print -r -- "$(now)  $name  $size bytes" > "$STATE/last-offsite"
+  say "encrypted copy saved and checked: $dest/$name"
+  return 0
+}
+
+cmd_offsite_status() {
+  local dest
+  if ! dest=$(offsite_dest); then print -r -- "Off-disk copies: not set up."; return 0; fi
+  print -r -- "Destination: $dest"
+  if security find-generic-password -s "$KC_SERVICE" -a "$USER" ${VAULT_KEYCHAIN:+"$VAULT_KEYCHAIN"} >/dev/null 2>&1; then
+    print -r -- "Password:    in the Keychain (item \"$KC_SERVICE\")"
+  else
+    print -r -- "Password:    MISSING from the Keychain (item \"$KC_SERVICE\")"
+  fi
+  if [[ -f "$STATE/last-offsite" ]]; then print -r -- "Last copy:   $(<"$STATE/last-offsite")"; else print -r -- "Last copy:   none yet"; fi
+  if offsite_due; then print -r -- "Next copy:   at the next sync"
+  else print -r -- "Next copy:   a day after the vault changes, or a week after the last copy"; fi
+}
+
+write_index() {
+  typeset -A prev proj srcstat
+  local r p s cur rel
+  if [[ -f "$STATE/index.tsv" ]]; then
+    while IFS=$'\t' read -r r p s; do prev[$r]=$p; done < "$STATE/index.tsv"
+  fi
+  for cur in "$CUR"/**/^.DS_Store(.DN); do
+    rel="${cur#$CUR/}"
+    if [[ -n ${FOUND[$rel]+x} ]]; then proj[$rel]="${FOUND[$rel]}"; srcstat[$rel]=ok
+    else
+      if [[ -e "$ROOT/$rel" ]]; then srcstat[$rel]="no longer watched"; else srcstat[$rel]=MISSING; fi
+      proj[$rel]="${prev[$rel]:-$(project_for "$rel")}"
+    fi
+  done
+
+  : > "$STATE/index.tsv"
+  typeset -A byproj
+  for rel in ${(ok)proj}; do
+    print -r -- "$rel"$'\t'"${proj[$rel]}"$'\t'"${srcstat[$rel]}" >> "$STATE/index.tsv"
+    byproj[${proj[$rel]}]+="$rel"$'\n'
+  done
+
+  local -a miss; for rel in ${(ok)srcstat}; do [[ ${srcstat[$rel]} == MISSING ]] && miss+=( "$rel" ); done
+  {
+    print -r -- "# Project Vault index"
+    print
+    print -r -- "Last sync: $(now) · ${#proj} files from ${#byproj} projects · ${#miss} with source missing"
+    print
+    print -r -- "Each file is in \`current/<same path as in your projects folder>\`. Older versions are in \`history/\`."
+    print -r -- "Restore a project with \`vault restore <project>\`. List a file's versions with \`vault history <file>\`."
+    print -r -- "\"Last edited\" is when that content was last saved in the project."
+    if (( ${#miss} )); then
+      print; print -r -- "## Source missing (the project copy is gone; the vault still has it)"; print
+      for rel in $miss; do print -r -- "- \`$rel\` (v$(current_version "$rel"))"; done
+    fi
+    local pr f
+    for pr in ${(ok)byproj}; do
+      print; print -r -- "## $pr"; print
+      print -r -- "| File | Version | Last edited | Source |"
+      print -r -- "|---|---|---|---|"
+      for f in ${(f)byproj[$pr]}; do
+        [[ -n $f ]] || continue
+        print -r -- "| \`${f#$pr/}\` | v$(current_version "$f") | $(stat -f '%Sm' -t '%Y-%m-%d %H:%M' "$CUR/$f") | ${srcstat[$f]} |"
+      done
+    done
+  } > "$INDEX_MD"
+}
+
+cmd_status() { cmd_sync 1 }
+
+restore_one() {   # $1 vault copy, $2 relative destination, $3 force
+  local from=$1 rel=$2 force=$3 dest="$ROOT/$2" keep
+  if [[ -e $dest ]]; then
+    if cmp -s "$from" "$dest"; then print -r -- "same      $rel"; return 0; fi
+    if (( ! force )); then
+      if [[ -t 0 ]] && read -q "?$rel differs from the vault copy. Overwrite it? [y/N] "; then
+        print
+      else
+        [[ -t 0 ]] && print
+        print -r -- "skipped   $rel  (differs; add --force to overwrite)"
+        return 0
+      fi
+    fi
+    keep="$HIST/$rel.pre-restore_$(date +%Y-%m-%d_%H%M%S)"
+    mkdir -p "${keep:h}" && cp -p "$dest" "$keep"
+    print -r -- "          your current $rel was saved as history/${keep#$HIST/}"
+  fi
+  # Project folders get normal permissions, not the vault's owner-only ones.
+  ( umask 022; mkdir -p "${dest:h}" ) && cp -p "$from" "$dest" || { warn "could not write $dest"; return 1 }
+  print -r -- "restored  $rel"
+  logline "RESTORED $rel  (from ${from#$VAULT/})"
+}
+
+cmd_restore() {
+  local target="" version="" force=0
+  while (( $# )); do
+    case $1 in
+      -f|--force)   force=1 ;;
+      -v|--version) shift; version="${1#v}" ;;
+      *)            target=$1 ;;
+    esac
+    shift
+  done
+  [[ -n $target ]] || { warn "usage: vault restore <project-or-file> [--version N] [--force]"; return 2 }
+  local rel; rel=$(resolve_target "$target") || return 1
+  if [[ -n $version ]]; then
+    [[ -f "$CUR/$rel" ]] || { warn "--version works on one file, not a folder: $rel"; return 2 }
+    local from; from=$(version_path "$rel" "$version") || return 1
+    restore_one "$from" "$rel" "$force"
+    return
+  fi
+  local -a files
+  if [[ -d "$CUR/$rel" ]]; then files=( "$CUR/$rel"/**/^.DS_Store(.DN) )
+  elif [[ -f "$CUR/$rel" ]]; then files=( "$CUR/$rel" )
+  else warn "nothing in the vault for: $rel"; return 1; fi
+  local f
+  for f in $files; do restore_one "$f" "${f#$CUR/}" "$force"; done
+}
+
+cmd_history() {
+  [[ -n $1 ]] || { warn "usage: vault history <file-or-project>"; return 2 }
+  local rel; rel=$(resolve_target "$1") || return 1
+  local f r
+  if [[ -d "$CUR/$rel" ]]; then
+    print -r -- "Files of $rel in the vault:"
+    for f in "$CUR/$rel"/**/^.DS_Store(.DN); do
+      r="${f#$CUR/}"; print -r -- "  v$(current_version "$r")  ${r#$rel/}"
+    done
+    return
+  fi
+  [[ -f "$CUR/$rel" ]] || { warn "not in the vault: $rel"; return 1 }
+  local base="${rel:t}" v
+  print -r -- "Versions of $rel (oldest first):"
+  for f in "$HIST/${rel:h}"/${(b)base}.v<->_*(Nn); do
+    v="${${f:t}#${base}.v}"; v="${v%%_*}"
+    print -r -- "  v$v  $(stat -f '%Sm' -t '%Y-%m-%d %H:%M' "$f")  $(stat -f %z "$f") bytes  history/${f#$HIST/}"
+  done
+  print -r -- "  v$(current_version "$rel")  $(stat -f '%Sm' -t '%Y-%m-%d %H:%M' "$CUR/$rel")  $(stat -f %z "$CUR/$rel") bytes  current/$rel  (current)"
+  for f in "$HIST/${rel:h}"/${(b)base}.pre-restore_*(N); do
+    print -r -- "  saved before a restore: history/${f#$HIST/}"
+  done
+}
+
+cmd_diff() {
+  [[ -n $1 ]] || { warn "usage: vault diff <file> [A] [B]"; return 2 }
+  local rel; rel=$(resolve_target "$1") || return 1
+  [[ -f "$CUR/$rel" ]] || { warn "not in the vault: $rel"; return 1 }
+  local cv; cv=$(current_version "$rel")
+  local a="${${2:-$(( cv - 1 ))}#v}" b="${${3:-$cv}#v}"
+  (( a >= 1 )) || { print -r -- "$rel has only one version (v1)."; return 0 }
+  local fa fb
+  fa=$(version_path "$rel" "$a") || return 1
+  fb=$(version_path "$rel" "$b") || return 1
+  diff -u -L "$rel v$a" -L "$rel v$b" "$fa" "$fb"
+  return 0
+}
+
+# ---------- background job (launchd) ----------
+JOB_LABEL="com.projectvault.sync"
+JOB_DOMAIN="gui/$(id -u)"
+JOB_PLIST="$HOME/Library/LaunchAgents/$JOB_LABEL.plist"
+JOB_AGENT="$HOME/Library/Application Support/ProjectVault/ProjectVaultAgent"
+
+job_loaded()   { launchctl print "$JOB_DOMAIN/$JOB_LABEL" >/dev/null 2>&1 }
+job_running()  { launchctl print "$JOB_DOMAIN/$JOB_LABEL" 2>/dev/null | grep -q 'state = running' }
+job_disabled() { launchctl print-disabled "$JOB_DOMAIN" 2>/dev/null | grep -qF "\"$JOB_LABEL\" => disabled" }
+
+# The launchd job: run `vault sync --quiet` through the helper every 15 minutes
+# and at login, at low priority, logging to ~/Library/Logs/ProjectVault.
+write_plist() {
+  mkdir -p "${JOB_PLIST:h}" "$HOME/Library/Logs/ProjectVault" || return 1
+  cat > "$JOB_PLIST" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>$JOB_LABEL</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>$JOB_AGENT</string>
+    <string>$APP_DIR/vault</string>
+    <string>sync</string>
+    <string>--quiet</string>
+  </array>
+  <key>StartInterval</key>
+  <integer>900</integer>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>ProcessType</key>
+  <string>Background</string>
+  <key>LowPriorityIO</key>
+  <true/>
+  <key>Nice</key>
+  <integer>10</integer>
+  <key>StandardOutPath</key>
+  <string>$HOME/Library/Logs/ProjectVault/agent.log</string>
+  <key>StandardErrorPath</key>
+  <string>$HOME/Library/Logs/ProjectVault/agent.log</string>
+</dict>
+</plist>
+EOF
+  chmod 644 "$JOB_PLIST"
+}
+
+cmd_start() {
+  # Put the job's pieces back if they went missing.
+  if [[ ! -f $JOB_PLIST ]]; then
+    write_plist || { warn "could not write $JOB_PLIST"; return 1 }
+  fi
+  if [[ ! -x $JOB_AGENT ]]; then
+    mkdir -p "${JOB_AGENT:h}"
+    xcrun clang -O2 -o "$JOB_AGENT" "$APP_DIR/ProjectVaultAgent.c" 2>/dev/null \
+      || { warn "could not build $JOB_AGENT (needs the Xcode command line tools: xcode-select --install)"; return 1 }
+  fi
+  launchctl enable "$JOB_DOMAIN/$JOB_LABEL"
+  if job_loaded; then
+    print -r -- "Background sync is already on. It runs every 15 minutes and starts by itself at login."
+  else
+    launchctl bootstrap "$JOB_DOMAIN" "$JOB_PLIST" || { warn "could not start the background job"; return 1 }
+    print -r -- "Background sync is on. It runs now, then every 15 minutes, and starts by itself at login."
+  fi
+}
+
+cmd_stop() {
+  launchctl disable "$JOB_DOMAIN/$JOB_LABEL"
+  if job_loaded; then
+    if job_running; then
+      print -r -- "A backup is running; waiting for it to finish..."
+      local i; for i in {1..90}; do job_running || break; sleep 2; done
+    fi
+    launchctl bootout "$JOB_DOMAIN/$JOB_LABEL" 2>/dev/null
+  fi
+  print -r -- "Background sync is off, and stays off after a restart."
+  print -r -- "Turn it back on with: vault start    Back up by hand any time with: vault sync"
+}
+
+cmd_service() {
+  if job_loaded; then
+    local info code
+    info=$(launchctl print "$JOB_DOMAIN/$JOB_LABEL" 2>/dev/null)
+    code=$(print -r -- "$info" | sed -n 's/^[[:space:]]*last exit code = //p' | head -1)
+    print -r -- "Background sync:  ON, every 15 minutes, starts by itself at login"
+    print -r -- "$info" | grep -q 'state = running' && print -r -- "                  backing up right now"
+    case $code in
+      0)                   print -r -- "Last run:         finished fine" ;;
+      ""|"(never exited)") print -r -- "Last run:         none finished since it was started" ;;
+      *)                   print -r -- "Last run:         FAILED ($code); see ~/Library/Logs/ProjectVault/agent.log" ;;
+    esac
+  elif job_disabled; then
+    print -r -- "Background sync:  OFF (turned off with vault stop). Turn on with: vault start"
+  else
+    print -r -- "Background sync:  not running. It starts at the next login, or now with: vault start"
+  fi
+  local line
+  if [[ -f "$STATE/last-sync" ]]; then line=$(<"$STATE/last-sync"); print -r -- "Last backup:      ${line[1,19]}"; fi
+  if offsite_dest >/dev/null; then
+    if [[ -f "$STATE/last-offsite" ]]; then line=$(<"$STATE/last-offsite"); print -r -- "iCloud copy:      ${line[1,19]}"
+    else print -r -- "iCloud copy:      none yet"; fi
+    [[ -f "$STATE/offsite-attempt" ]] && print -r -- "                  last try FAILED; try now with: vault offsite"
+  else
+    print -r -- "iCloud copy:      not set up"
+  fi
+  local pid=""
+  [[ -f "$STATE/ui.json" ]] && pid=$(sed -n 's/.*"pid": *\([0-9]*\).*/\1/p' "$STATE/ui.json")
+  if [[ -n $pid ]] && kill -0 "$pid" 2>/dev/null; then
+    print -r -- "Window:           open (bring it back with the Project Vault app)"
+  else
+    print -r -- "Window:           closed (open it with the Project Vault app, or: vault ui)"
+  fi
+}
+
+cmd_offsite_setup() {
+  [[ -t 0 ]] || { warn "run this in Terminal: vault offsite setup"; return 1 }
+  local icloud="$HOME/Library/Mobile Documents/com~apple~CloudDocs" def="" dest=""
+  [[ -d $icloud ]] && def="$icloud/ProjectVault Backups"
+  print -r -- "Project Vault can keep encrypted (AES-256) copies of the vault off this Mac."
+  print -r -- "A copy is made a day after anything changes, and at least once a week."
+  print
+  if [[ -n $def ]]; then
+    print -r -- "Where should the copies go? Press Return for iCloud Drive (ProjectVault Backups),"
+    print -r -- "or type another folder, such as a Google Drive or Dropbox folder, or a USB drive."
+  else
+    print -r -- "Where should the copies go? Type a folder that syncs off this Mac, such as a"
+    print -r -- "Google Drive or Dropbox folder, or a folder on a USB drive."
+  fi
+  read -r "dest?Folder: "
+  dest="${dest:-$def}"; dest="${dest/#\~/$HOME}"; dest="${dest%/}"
+  [[ -n $dest ]] || { warn "no folder given; nothing changed"; return 1 }
+  mkdir -p "$dest" 2>/dev/null
+  [[ -d $dest && -w $dest ]] || { warn "cannot write to $dest; nothing changed"; return 1 }
+  print
+  print -r -- "Now choose the backup password. Save it in your password manager FIRST:"
+  print -r -- "without it, nobody can open the copies, not even you. You will type it twice."
+  security add-generic-password -U -a "$USER" -s "$KC_SERVICE" -l "$KC_SERVICE" \
+    -j "Password for the encrypted Project Vault copies" -w \
+    || { warn "the password was not saved; nothing changed"; return 1 }
+  { print -r -- "DEST=${dest/#$HOME/~}"; print -r -- "KEEP=12"; } > "$OFFSITE_CONF"
+  print -r -- "Saved: the password is in your login Keychain as \"$KC_SERVICE\"."
+  print -r -- "Making the first copy now..."
+  cmd_offsite_now
+}
+
+usage() {
+  cat <<EOF
+Project Vault $VERSION: a versioned backup of the gitignored files your projects need
+Projects folder: $ROOT
+Vault folder:    $VAULT
+
+  vault sync                  back up now (also runs by itself every 15 minutes)
+  vault status                show what is new, changed or missing, without saving
+  vault restore <path>        put a project's (or one file's) files back where they belong
+        --version N           restore an older version of one file
+        --force               overwrite without asking (your current file is saved first)
+  vault history <path>        list the versions of a file, or the files of a project
+  vault diff <file> [A] [B]   show what changed between two versions (default: previous vs current)
+  vault open                  open the vault in Finder
+  vault ui                    open the Project Vault window in your browser
+
+  vault offsite setup         choose where encrypted copies go and set their password
+  vault offsite               make an encrypted copy now (also automatic)
+  vault offsite status        where copies go, and when the last one was made
+
+  vault service               is the background sync on? last backup, last copy, window
+  vault stop                  turn the background sync off (stays off after a restart)
+  vault start                 turn the background sync on again
+  vault version               show the version
+
+<path> is relative to the projects folder (acme/shop-backend, or acme/shop-backend/.env
+for one file), or relative to the folder you are in (vault restore . inside a project).
+EOF
+}
+
+# One sync or off-disk copy at a time. The lock holds its owner's process id,
+# so a run that was stopped halfway (vault stop, shutdown) does not block the next.
+LOCK="$STATE/sync.lock"
+take_lock() {
+  mkdir -p "$STATE"
+  if ! mkdir "$LOCK" 2>/dev/null; then
+    local pid; pid=$(cat "$LOCK/pid" 2>/dev/null)
+    local held=0
+    if [[ -n $pid ]]; then
+      kill -0 "$pid" 2>/dev/null && [[ -z $(find "$LOCK" -maxdepth 0 -mmin +30 2>/dev/null) ]] && held=1
+    else
+      # No owner written yet: only stale if it is more than a minute old.
+      [[ -z $(find "$LOCK" -maxdepth 0 -mmin +1 2>/dev/null) ]] && held=1
+    fi
+    if (( held )); then warn "another sync is running; try again in a minute"; return 1; fi
+    rm -rf "$LOCK"
+    mkdir "$LOCK" 2>/dev/null || { warn "another sync is running; try again in a minute"; return 1 }
+  fi
+  print -r -- $$ > "$LOCK/pid"
+}
+
+case ${1:-help} in
+  sync)
+    shift; [[ $1 == (-q|--quiet) ]] && QUIET=1
+    take_lock || exit 0
+    trap 'rm -rf "$LOCK"' EXIT
+    cmd_sync 0 ;;
+  offsite)
+    shift
+    case ${1:-now} in
+      now)
+        take_lock || exit 1
+        trap 'rm -rf "$LOCK"' EXIT
+        cmd_offsite_now ;;
+      status) cmd_offsite_status ;;
+      setup)
+        take_lock || exit 1
+        trap 'rm -rf "$LOCK"' EXIT
+        cmd_offsite_setup ;;
+      *) warn "usage: vault offsite [now|status|setup]"; exit 2 ;;
+    esac ;;
+  status)  cmd_status ;;
+  service) cmd_service ;;
+  start)   cmd_start ;;
+  stop)    cmd_stop ;;
+  restore) shift; cmd_restore "$@" ;;
+  history) shift; cmd_history "$@" ;;
+  diff)    shift; cmd_diff "$@" ;;
+  open)    open "$VAULT" ;;
+  ui)
+    shift
+    export VAULT_ROOT="$ROOT" VAULT_DIR="$VAULT"
+    exec /usr/bin/python3 "$APP_DIR/vault_ui.py" "$@" ;;
+  version|-v|--version) print -r -- "Project Vault $VERSION" ;;
+  _write-job) write_plist ;;   # used by install.sh
+  help|-h|--help) usage ;;
+  *) warn "unknown command: $1"; usage; exit 2 ;;
+esac

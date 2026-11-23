@@ -1,0 +1,11 @@
+# Extra files or folders to back up, one per line, relative to your projects folder.
+#
+# .env files, Firebase files, keystores and key.properties are picked up
+# automatically. Add a line here for anything else a project needs that git
+# ignores: a config.json, a certificate, or a whole folder of credentials.
+# Folders are copied whole (dependency and build folders inside are skipped).
+# Lines starting with # are ignored. The Project Vault window can add lines for you.
+#
+# Examples:
+#   acme/shop-backend/config/local.json
+#   credentials/stripe

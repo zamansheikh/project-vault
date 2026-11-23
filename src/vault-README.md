@@ -33,7 +33,9 @@ Names starting with a dot (`.env`) are hidden in Finder: press **Cmd + Shift + .
 | Get an older version of a file | `vault history <file>`, then `vault restore <file> --version N` |
 | Check the background backup | `vault service` |
 | Stop / start the background backup | `vault stop` / `vault start` |
-| Keep encrypted copies off this Mac | `vault offsite setup` |
+| Keep encrypted copies in iCloud Drive (or another cloud folder) | `vault offsite setup` |
+| Keep encrypted copies on a USB drive | `vault usb setup` |
+| Open a copy on Windows | `tools/restore-windows.ps1` from the GitHub page above |
 | See every command | `vault help` |
 
 Nothing in this folder is ever deleted by Project Vault. If a project or file

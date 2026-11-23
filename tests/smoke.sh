@@ -88,9 +88,47 @@ check "the .dmg is encrypted"                     zsh -c "hdiutil isencrypted '$
 mkdir -p "$T/m"
 check "a wrong password does not open it"         zsh -c "! printf wrong | hdiutil attach -quiet -nobrowse -readonly -stdinpass -mountpoint '$T/m' '${dmg[1]}'"
 check "the right password opens it"               zsh -c "printf '%s' '$TP' | hdiutil attach -quiet -nobrowse -readonly -stdinpass -mountpoint '$T/m' '${dmg[1]}' && test -f '$T/m/_ProjectVault/current/acme/shop-app/.env' && hdiutil detach -quiet '$T/m'"
+enc=( "$T"/offsite/ProjectVault-*.tar.gz.enc(N) )
+ENC=( enc -d -aes-256-cbc -pbkdf2 -iter 600000 -md sha256 -pass stdin -in "${enc[1]}" )
+check "a Windows/Linux .tar.gz.enc is made too"   test ${#enc} -eq 1
+check "it starts with OpenSSL's Salted__ header"  zsh -c "head -c 8 '${enc[1]}' | grep -q Salted__"
+check "the right password opens it (LibreSSL)"    zsh -c "printf '%s\n' '$TP' | /usr/bin/openssl ${ENC[*]} | tar -tzf - | grep -q '_ProjectVault/current/acme/shop-app/.env'"
+check "a wrong password does not open it"         zsh -c "! printf 'wrong\n' | /usr/bin/openssl ${ENC[*]} -out /dev/null"
+OSSL3=/opt/homebrew/opt/openssl@3/bin/openssl
+if [[ -x $OSSL3 ]]; then
+  check "OpenSSL 3 (as in Git for Windows) opens it" zsh -c "printf '%s\n' '$TP' | $OSSL3 ${ENC[*]} | tar -tzf - | grep -q 'HOW TO RESTORE.txt'"
+  # Exactly what tools/restore-windows.ps1 runs: password in an environment variable.
+  mkdir -p "$T/win"
+  check "the Windows script's OpenSSL command works" zsh -c "PV_BACKUP_PASSWORD='$TP' $OSSL3 enc -d -aes-256-cbc -pbkdf2 -iter 600000 -md sha256 -pass env:PV_BACKUP_PASSWORD -in '${enc[1]}' -out '$T/win/x.tar.gz' && tar -xzf '$T/win/x.tar.gz' -C '$T/win' && test -f '$T/win/_ProjectVault/current/acme/shop-app/.env'"
+fi
+check "the archive has no Mac-only ._ files"      zsh -c "! (printf '%s\n' '$TP' | /usr/bin/openssl ${ENC[*]} | tar -tzf - | grep -q '/\._')"
+check "README-RESTORE.txt is next to the copies"  grep -q 'restore-windows.ps1' "$T/offsite/README-RESTORE.txt"
 for i in 1 2; do sleep 1; vault offsite >/dev/null; done
-dmg=( "$T"/offsite/ProjectVault-*.dmg(N) )
-check "only KEEP=2 copies are kept"               test ${#dmg} -eq 2
+dmg=( "$T"/offsite/ProjectVault-*.dmg(N) ); enc=( "$T"/offsite/ProjectVault-*.tar.gz.enc(N) )
+check "only KEEP=2 copies of each kind are kept"  test ${#dmg} -eq 2 -a ${#enc} -eq 2
+
+# A USB drive: an ExFAT disk image mounted outside /Volumes stands in for one.
+hdiutil create -quiet -size 40m -fs ExFAT -volname PVSMOKE "$T/usb.dmg"
+mkdir -p "$T/usb"
+if hdiutil attach -quiet -nobrowse -mountpoint "$T/usb" "$T/usb.dmg"; then
+  uuid=$(diskutil info -plist "$T/usb" | plutil -extract VolumeUUID raw -o - -)
+  printf 'USB_UUID=%s\nUSB_NAME=PVSMOKE\n' "$uuid" >> "$VA/offsite.conf"
+  vault sync -q >/dev/null
+  usbc=( "$T"/usb/"ProjectVault Backups"/ProjectVault-*(N) )
+  check "plugging in the USB drive makes a copy"  test ${#usbc} -eq 2
+  check "no hidden ._ files left on the drive"    zsh -c "! ls -A '$T/usb' '$T/usb/ProjectVault Backups' | grep -q '^\._'"
+  check "vault usb status sees the drive"         zsh -c "zsh '$V' usb status | grep -q 'plugged in'"
+  vault sync -q >/dev/null
+  usbc=( "$T"/usb/"ProjectVault Backups"/ProjectVault-*(N) )
+  check "no new USB copy when nothing changed"    test ${#usbc} -eq 2
+  sleep 1; echo 'API_KEY=four' > "$P/acme/shop-app/.env"; vault sync -q >/dev/null
+  usbc=( "$T"/usb/"ProjectVault Backups"/ProjectVault-*(N) )
+  check "a change makes a new USB copy"           test ${#usbc} -eq 4
+  hdiutil detach -quiet "$T/usb" || hdiutil detach -quiet -force "$T/usb"
+  check "unplugged: status says not plugged in"   zsh -c "zsh '$V' usb status | grep -q 'not plugged in'"
+else
+  print -P "  %F{yellow}skip%f  could not mount a test USB image"
+fi
 
 print
 if (( failed )); then print -P "%F{red}$failed failed%f, $pass passed"; exit 1; fi

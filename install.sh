@@ -188,7 +188,8 @@ step "Done"
 cat <<EOF
     vault service         check the background backup
     vault ui              open the Project Vault window (or the Project Vault app)
-    vault offsite setup   keep encrypted copies in iCloud Drive or another folder (recommended)
+    vault offsite setup   keep encrypted copies in iCloud Drive or another cloud folder (recommended)
+    vault usb setup       keep encrypted copies on a USB drive whenever it is plugged in
     vault help            every command
 
     Spotlight indexes the vault by default. To keep secrets out of search results,

@@ -381,13 +381,20 @@ function renderHeader() {
   if (a.loaded && a.lastExit && !/^(0|\(never exited\))$/.test(a.lastExit)) {
     job += ` · <span class="bad-text">last run failed (${esc(a.lastExit)})</span>`;
   }
-  const o = s.offsite || {};
-  let off = "Off-disk copy: not set up";
+  const o = s.offsite || {}, u = o.usb || {};
+  const parts = [];
   if (o.configured) {
-    off = `Encrypted copy in ${esc(tilde(o.where))}: ` + (o.last ? `<b>${esc(ago(o.last.at))}</b>` : "<b>none yet</b>") +
-      (o.failing ? ` <span class="bad-text">(last try failed)</span>` : "") +
-      ` <button class="link" id="offsiteNow">Copy now</button>`;
+    parts.push(`Encrypted copy in ${esc(tilde(o.where))}: ` + (o.last ? `<b>${esc(ago(o.last.at))}</b>` : "<b>none yet</b>") +
+      (o.failing ? ` <span class="bad-text">(last try failed)</span>` : ""));
   }
+  if (u.configured) {
+    const old = u.last && (Date.now() - new Date(u.last.at.replace(" ", "T"))) > 14 * 86400000;
+    parts.push(`USB copy on ${esc(u.name)}: ` + (u.last ? `<b>${esc(ago(u.last.at))}</b>` : "<b>none yet</b>") +
+      (u.failing ? ` <span class="bad-text">(last try failed)</span>`
+        : old && !u.plugged ? ` <span class="bad-text">(plug it in)</span>` : u.plugged ? " (plugged in)" : ""));
+  }
+  let off = parts.length ? parts.join(" · ") + ` <button class="link" id="offsiteNow">Copy now</button>`
+    : "Off-disk copy: not set up (vault offsite setup or vault usb setup)";
   $("#subline").innerHTML = (ls ? `Last sync <b>${esc(ago(ls.at))}</b> <span class="muted">(${esc(ls.at)})</span>` : "Never synced") +
     ` · ${job} · ${off}`;
   const f = [["all", "All", s.projectCount], ["missing", "Missing", s.projects.filter(p => p.missing).length],

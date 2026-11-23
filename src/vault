@@ -10,7 +10,7 @@ umask 077
 # BSD tools first: the script relies on macOS stat/cp/diff flags.
 export PATH="/usr/bin:/bin:/usr/sbin:/sbin:$PATH"
 
-VERSION="1.0.0"
+VERSION="1.1.0"
 APP_DIR="${0:A:h}"
 # Written by install.sh: ROOT (the folder that holds your projects) and VAULT.
 CONFIG="${VAULT_CONFIG:-$HOME/Library/Application Support/ProjectVault/config}"
@@ -242,10 +242,18 @@ cmd_sync() {
 }
 
 # ---------- off-disk encrypted copies ----------
-# offsite.conf holds DEST=<folder> (and optionally KEEP=<how many copies>).
-# The password lives in the macOS Keychain, never in a file.
+# offsite.conf keys:
+#   DEST=<folder>      a folder that syncs off this Mac (iCloud Drive, Google Drive, Dropbox)
+#   USB_UUID=<uuid>    the USB drive chosen with `vault usb setup` (and USB_NAME, for messages)
+#   KEEP=<n>           how many copies to keep in each place (default 12)
+# Every copy is made in two formats, with the same password:
+#   ProjectVault-<date>.dmg          macOS encrypted disk image: double-click it on a Mac
+#   ProjectVault-<date>.tar.gz.enc   AES-256 archive (OpenSSL, PBKDF2): opens on Windows and Linux
+# The password lives in the macOS Keychain, never in a file or on a command line.
 OFFSITE_CONF="$VAULT/offsite.conf"
 KC_SERVICE="${VAULT_KC_SERVICE:-Project Vault backup}"
+USB_DIR="ProjectVault Backups"
+ENC_ARGS=( -aes-256-cbc -pbkdf2 -iter 600000 -md sha256 )
 
 offsite_setting() {   # $1 = key; prints its value from offsite.conf
   local line
@@ -256,45 +264,116 @@ offsite_setting() {   # $1 = key; prints its value from offsite.conf
   return 1
 }
 
+offsite_set() {   # $1 = key, $2 = value (empty removes the key); keeps the other lines
+  local key=$1 val=$2 line
+  local -a keep
+  if [[ -f $OFFSITE_CONF ]]; then
+    while IFS= read -r line || [[ -n $line ]]; do
+      [[ $line == "$key="* ]] || keep+=( "$line" )
+    done < "$OFFSITE_CONF"
+  fi
+  [[ -n $val ]] && keep+=( "$key=$val" )
+  print -rl -- $keep > "$OFFSITE_CONF"
+}
+
 offsite_dest() {
   if [[ -n $VAULT_OFFSITE_DEST ]]; then print -r -- "$VAULT_OFFSITE_DEST"; return 0; fi
   local d; d=$(offsite_setting DEST) || return 1
+  [[ -n $d ]] || return 1
   print -r -- "${d/#\~/$HOME}"
 }
 
-# Due when there is no copy yet, the last one is a week old, or the vault
-# changed since the last one and that one is at least a day old.
-offsite_due() {
-  offsite_dest >/dev/null || return 1
+usb_name() { offsite_setting USB_NAME || print -r -- "the USB drive" }
+
+usb_mount() {   # where the chosen USB drive is mounted; fails when it is not plugged in
+  local uuid mp
+  uuid=$(offsite_setting USB_UUID) || return 1
+  [[ -n $uuid ]] || return 1
+  mp=$(diskutil info -plist "$uuid" 2>/dev/null | plutil -extract MountPoint raw -o - - 2>/dev/null) || return 1
+  [[ -n $mp && -d $mp && -w $mp ]] || return 1
+  print -r -- "$mp"
+}
+
+have_password() {
+  security find-generic-password -s "$KC_SERVICE" -a "$USER" ${VAULT_KEYCHAIN:+"$VAULT_KEYCHAIN"} >/dev/null 2>&1
+}
+
+older_than() { [[ -n $(find "$1" -mmin +$2 2>/dev/null) ]] }   # $1 file, $2 minutes
+
+# The cloud folder gets a copy a day after the vault changes, and at least weekly.
+# The USB drive gets one whenever it is plugged in and the vault changed since
+# its last copy, and at least weekly.
+cloud_due() {
   local last="$STATE/last-offsite"
   [[ -f $last ]] || return 0
-  [[ -n $(find "$last" -mmin +$(( 7 * 24 * 60 )) 2>/dev/null) ]] && return 0
-  [[ -n $(find "$last" -mmin +$(( 24 * 60 )) 2>/dev/null) && $LOG -nt $last ]] && return 0
+  older_than "$last" $(( 7 * 24 * 60 )) && return 0
+  older_than "$last" $(( 24 * 60 )) && [[ $LOG -nt $last ]] && return 0
+  return 1
+}
+usb_due() {
+  local last="$STATE/last-usb"
+  [[ -f $last ]] || return 0
+  [[ $LOG -nt $last ]] && return 0
+  older_than "$last" $(( 7 * 24 * 60 )) && return 0
   return 1
 }
 
+# One line per destination: kind <TAB> folder. With $1 = due, only those that are due.
+offsite_targets() {
+  local which=$1 d mp
+  if d=$(offsite_dest); then
+    [[ $which != due ]] || cloud_due && print -r -- "cloud"$'\t'"$d"
+  fi
+  if mp=$(usb_mount); then
+    [[ $which != due ]] || usb_due && print -r -- "usb"$'\t'"$mp/$USB_DIR"
+  fi
+}
+
 offsite_if_due() {
-  offsite_due || return 0
-  local att="$STATE/offsite-attempt"
-  # After a failure, try again at most every 6 hours instead of every sync.
-  [[ -f $att && -n $(find "$att" -mmin -360 2>/dev/null) ]] && return 0
-  touch "$att"
-  cmd_offsite_now && rm -f "$att"
+  local -a due ready
+  local t kind att
+  due=( ${(f)"$(offsite_targets due)"} )
+  (( ${#due} )) || return 0
+  # After a failure, try a destination again at most every 6 hours, not every sync.
+  for t in $due; do
+    kind=${t%%$'\t'*}; att="$STATE/attempt-$kind"
+    [[ -f $att ]] && ! older_than "$att" 360 && continue
+    ready+=( "$t" )
+  done
+  (( ${#ready} )) || return 0
+  make_copies "${ready[@]}"
   return 0
 }
 
-# Make one encrypted (AES-256) .dmg of the whole vault, open it to check every
-# file matches, then copy it to the destination.
 cmd_offsite_now() {
-  local dest; dest=$(offsite_dest) || { warn "off-disk copies are not set up (no offsite.conf)"; return 1 }
+  local -a targets
+  targets=( ${(f)"$(offsite_targets all)"} )
+  if (( ! ${#targets} )); then
+    if offsite_setting USB_UUID >/dev/null && ! offsite_dest >/dev/null; then
+      warn "$(usb_name) is not plugged in, and no other destination is set up"
+    else
+      warn "encrypted copies are not set up; run: vault offsite setup (a folder) or vault usb setup (a USB drive)"
+    fi
+    return 1
+  fi
+  make_copies "${targets[@]}"
+}
+
+# Make both encrypted formats of the whole vault, open each one to check every
+# file matches, then copy them to each destination ("kind<TAB>folder" arguments).
+make_copies() {
+  local -a targets=( "$@" )
+  local t kind dir
   local pw; pw=$(security find-generic-password -s "$KC_SERVICE" -a "$USER" -w ${VAULT_KEYCHAIN:+"$VAULT_KEYCHAIN"} 2>/dev/null) || {
-    warn "the backup password is not in the Keychain (item \"$KC_SERVICE\"); set it with: vault offsite setup"; return 1 }
+    warn "the backup password is not in the Keychain (item \"$KC_SERVICE\"); set it with: vault offsite setup"
+    for t in $targets; do touch "$STATE/attempt-${t%%$'\t'*}"; done
+    return 1 }
   local work; work=$(mktemp -d "${TMPDIR:-/tmp}/projectvault.XXXXXX") || { pw=""; return 1 }
   local stamp; stamp=$(date +%Y-%m-%d_%H%M%S)
-  local name="ProjectVault-$stamp.dmg"
-  local stage="$work/stage" img="$work/$name" mnt="$work/mnt" ok=0
-  mkdir -p "$stage" "$mnt"
-  if rsync -a --exclude '.state/ui.json' --exclude '.state/sync.lock' --exclude '.state/offsite-attempt' \
+  local base="ProjectVault-$stamp"
+  local stage="$work/stage" mnt="$work/mnt" check="$work/check" ok_dmg=0 ok_enc=0
+  mkdir -p "$stage" "$mnt" "$check"
+  if rsync -a --exclude '.state/ui.json' --exclude '.state/sync.lock' --exclude '.state/attempt-*' \
        --exclude '.DS_Store' "$VAULT/" "$stage/_ProjectVault/"; then
     cat > "$stage/HOW TO RESTORE.txt" <<EOF
 Project Vault encrypted copy, made $(now).
@@ -302,60 +381,251 @@ Project Vault encrypted copy, made $(now).
 Your projects folder when this copy was made: $ROOT
 
 Every file is in _ProjectVault/current/, at the same path it had inside that
-folder. To take one or two files, just copy them out.
+folder. Older versions are in _ProjectVault/history/. To take one or two files,
+just copy them out.
 
-To put everything back on a new Mac:
+To keep going on a Mac:
 1. Copy the _ProjectVault folder to $VAULT
 2. Install Project Vault: https://github.com/zamansheikh/project-vault
    (git clone, then ./install.sh --root "$ROOT")
 3. Clone your projects again, then run:  vault restore <project folder>
 
-_ProjectVault/README.md explains the layout.
+On Windows, tools/restore-windows.ps1 from that page can copy every file back
+into your projects folder (-ProjectsFolder C:\path\to\projects).
 EOF
+    # 1. macOS encrypted disk image.
     if printf '%s' "$pw" | hdiutil create -quiet -srcfolder "$stage" -volname "ProjectVault $stamp" \
-         -fs APFS -format UDZO -encryption AES-256 -stdinpass "$img" \
-       && printf '%s' "$pw" | hdiutil attach -quiet -nobrowse -noautoopen -readonly -stdinpass -mountpoint "$mnt" "$img"; then
-      diff -rq -x .fseventsd -x .Trashes -x .Spotlight-V100 -x .DS_Store "$stage" "$mnt" >/dev/null && ok=1
+         -fs APFS -format UDZO -encryption AES-256 -stdinpass "$work/$base.dmg" \
+       && printf '%s' "$pw" | hdiutil attach -quiet -nobrowse -noautoopen -readonly -stdinpass -mountpoint "$mnt" "$work/$base.dmg"; then
+      diff -rq -x .fseventsd -x .Trashes -x .Spotlight-V100 -x .DS_Store "$stage" "$mnt" >/dev/null && ok_dmg=1
       hdiutil detach -quiet "$mnt" 2>/dev/null || hdiutil detach -quiet -force "$mnt" 2>/dev/null
+    fi
+    # 2. Portable archive for Windows and Linux: tar.gz encrypted with OpenSSL.
+    if (cd "$stage" && COPYFILE_DISABLE=1 tar -czf "$work/$base.tar.gz" .) \
+       && printf '%s\n' "$pw" | /usr/bin/openssl enc "${ENC_ARGS[@]}" -salt -in "$work/$base.tar.gz" -out "$work/$base.tar.gz.enc" -pass stdin \
+       && printf '%s\n' "$pw" | /usr/bin/openssl enc -d "${ENC_ARGS[@]}" -in "$work/$base.tar.gz.enc" -pass stdin | tar -xzf - -C "$check"; then
+      diff -rq "$stage" "$check" >/dev/null && ok_enc=1
     fi
   fi
   pw=""
-  if (( ! ok )); then
+  if (( ! ok_dmg || ! ok_enc )); then
     warn "could not make or check the encrypted copy; nothing was copied"
+    for t in $targets; do touch "$STATE/attempt-${t%%$'\t'*}"; done
     rm -rf "$work"; return 1
   fi
-  if ! { mkdir -p "$dest" && cp "$img" "$dest/$name.partial" && mv "$dest/$name.partial" "$dest/$name"; }; then
-    warn "could not write to $dest (if it is iCloud Drive or another protected folder, add ~/Library/Application Support/ProjectVault/ProjectVaultAgent under System Settings > Privacy & Security > Full Disk Access)"
-    rm -f "$dest/$name.partial" 2>/dev/null; rm -rf "$work"; return 1
-  fi
-  local size; size=$(stat -f %z "$dest/$name")
+  local failed=0
+  for t in $targets; do
+    kind=${t%%$'\t'*}; dir=${t#*$'\t'}
+    if deliver "$kind" "$dir"; then rm -f "$STATE/attempt-$kind"; else touch "$STATE/attempt-$kind"; failed=1; fi
+  done
   rm -rf "$work"
-  logline "OFFSITE  $name  ($size bytes, checked)  -> $dest"
+  return $failed
+}
+
+# Copy the two files made by make_copies into one destination folder.
+deliver() {
+  local kind=$1 dir=$2 f size where
+  [[ $kind == usb ]] && where="USB drive $(usb_name)" || where="$dir"
+  if ! mkdir -p "$dir" 2>/dev/null; then
+    warn "could not write to $where (if macOS blocked it, add ~/Library/Application Support/ProjectVault/ProjectVaultAgent under System Settings > Privacy & Security > Full Disk Access)"
+    return 1
+  fi
+  for f in "$base.dmg" "$base.tar.gz.enc"; do
+    if ! { cp -X "$work/$f" "$dir/$f.partial" && mv "$dir/$f.partial" "$dir/$f"; }; then
+      rm -f "$dir/$f.partial" 2>/dev/null
+      warn "could not write to $where (if macOS blocked it, add ~/Library/Application Support/ProjectVault/ProjectVaultAgent under System Settings > Privacy & Security > Full Disk Access)"
+      return 1
+    fi
+  done
+  write_restore_note "$dir/README-RESTORE.txt"
+  # On ExFAT and FAT drives macOS stores file tags in hidden "._<name>" files.
+  # Remove the ones belonging to our own files, so the folder is clean on Windows.
+  for f in "$base.dmg" "$base.tar.gz.enc" README-RESTORE.txt; do rm -f "$dir/._$f" "$dir/._$f.partial"; done
+  rm -f "${dir:h}/._${dir:t}"
+  size=$(( $(stat -f %z "$dir/$base.dmg") + $(stat -f %z "$dir/$base.tar.gz.enc") ))
+  logline "OFFSITE  $base (.dmg + .tar.gz.enc, $size bytes, checked)  -> $kind: $dir"
   # Every copy holds the full history, so only the newest few are kept.
   local keep; keep=$(offsite_setting KEEP) || keep=12
-  local -a all; all=( "$dest"/ProjectVault-*.dmg(Nom) )
-  local old
-  for old in ${all[keep+1,-1]}; do
-    rm -f "$old" && logline "OFFSITE  removed old copy ${old:t}"
+  local -a all; local old pat
+  for pat in 'ProjectVault-*.dmg' 'ProjectVault-*.tar.gz.enc'; do
+    all=( "$dir"/${~pat}(Nom) )
+    for old in ${all[keep+1,-1]}; do rm -f "$old" && logline "OFFSITE  removed old copy ${old:t} ($kind)"; done
   done
   # Written last, so the log lines above do not count as a change.
-  print -r -- "$(now)  $name  $size bytes" > "$STATE/last-offsite"
-  say "encrypted copy saved and checked: $dest/$name"
+  print -r -- "$(now)  $base  $size bytes" > "$STATE/last-$([[ $kind == usb ]] && print usb || print offsite)"
+  say "encrypted copy saved and checked: $where ($base)"
+  return 0
+}
+
+# Plain instructions next to the copies, readable without Project Vault.
+write_restore_note() {
+  cat > "$1" <<'EOF'
+Project Vault encrypted backups
+===============================
+
+Every backup is saved twice, with the same password:
+
+  ProjectVault-<date>.dmg          On a Mac: double-click it and type the password.
+  ProjectVault-<date>.tar.gz.enc   On Windows or Linux (or a Mac without Project Vault).
+
+Open the newest one. Inside is a _ProjectVault folder: every file is in
+_ProjectVault/current/, at the same path it had in your projects folder.
+The password is the one you chose for Project Vault (keep it in your password manager).
+
+On Windows
+----------
+You need Git for Windows (it includes OpenSSL): https://git-scm.com/download/win
+
+Easiest: download tools/restore-windows.ps1 from
+https://github.com/zamansheikh/project-vault and run in PowerShell:
+
+  powershell -ExecutionPolicy Bypass -File restore-windows.ps1 "<path to ProjectVault-<date>.tar.gz.enc>"
+
+It asks for the password and unpacks into %USERPROFILE%\ProjectVault-restore.
+Add -ProjectsFolder C:\path\to\projects to also copy every file back into
+your cloned projects.
+
+Or in Git Bash:
+
+  read -rsp "Password: " PW; echo
+  printf '%s\n' "$PW" | openssl enc -d -aes-256-cbc -pbkdf2 -iter 600000 -md sha256 -pass stdin -in ProjectVault-<date>.tar.gz.enc | tar -xzf -
+  unset PW
+
+On Linux, or in a Mac terminal
+------------------------------
+  openssl enc -d -aes-256-cbc -pbkdf2 -iter 600000 -md sha256 -in ProjectVault-<date>.tar.gz.enc | tar -xzf -
+EOF
+}
+
+ascii_password() {   # 0 when the Keychain password uses only standard keyboard characters
+  security find-generic-password -s "$KC_SERVICE" -a "$USER" -w ${VAULT_KEYCHAIN:+"$VAULT_KEYCHAIN"} 2>/dev/null \
+    | LC_ALL=C grep -q '[^ -~]' && return 1
   return 0
 }
 
 cmd_offsite_status() {
-  local dest
-  if ! dest=$(offsite_dest); then print -r -- "Off-disk copies: not set up."; return 0; fi
-  print -r -- "Destination: $dest"
-  if security find-generic-password -s "$KC_SERVICE" -a "$USER" ${VAULT_KEYCHAIN:+"$VAULT_KEYCHAIN"} >/dev/null 2>&1; then
-    print -r -- "Password:    in the Keychain (item \"$KC_SERVICE\")"
+  local d mp
+  if have_password; then
+    print -r -- "Password:      in the Keychain (item \"$KC_SERVICE\")"
+    ascii_password || print -r -- "               note: it has non-English characters; on Windows use the Git Bash method"
   else
-    print -r -- "Password:    MISSING from the Keychain (item \"$KC_SERVICE\")"
+    print -r -- "Password:      not set (vault offsite setup or vault usb setup)"
   fi
-  if [[ -f "$STATE/last-offsite" ]]; then print -r -- "Last copy:   $(<"$STATE/last-offsite")"; else print -r -- "Last copy:   none yet"; fi
-  if offsite_due; then print -r -- "Next copy:   at the next sync"
-  else print -r -- "Next copy:   a day after the vault changes, or a week after the last copy"; fi
+  if d=$(offsite_dest); then
+    print -r -- "Folder:        $d"
+    if [[ -f "$STATE/last-offsite" ]]; then print -r -- "  last copy:   $(<"$STATE/last-offsite")"; else print -r -- "  last copy:   none yet"; fi
+    [[ -f "$STATE/attempt-cloud" ]] && print -r -- "  last try FAILED (see ~/Library/Logs/ProjectVault/agent.log)"
+  else
+    print -r -- "Folder:        not set up (vault offsite setup)"
+  fi
+  if offsite_setting USB_UUID >/dev/null; then
+    if mp=$(usb_mount); then print -r -- "USB drive:     $(usb_name), plugged in at $mp"
+    else print -r -- "USB drive:     $(usb_name), not plugged in"; fi
+    if [[ -f "$STATE/last-usb" ]]; then print -r -- "  last copy:   $(<"$STATE/last-usb")"; else print -r -- "  last copy:   none yet"; fi
+    [[ -f "$STATE/attempt-usb" ]] && print -r -- "  last try FAILED (see ~/Library/Logs/ProjectVault/agent.log)"
+  else
+    print -r -- "USB drive:     not set up (vault usb setup)"
+  fi
+}
+
+# Ask for the backup password once and keep it in the login Keychain.
+ensure_password() {
+  have_password && return 0
+  print
+  print -r -- "Choose the backup password. Save it in your password manager FIRST:"
+  print -r -- "without it, nobody can open the copies, not even you. Use standard keyboard"
+  print -r -- "characters so it also works on Windows. You will type it twice."
+  security add-generic-password -U -a "$USER" -s "$KC_SERVICE" -l "$KC_SERVICE" \
+    -j "Password for the encrypted Project Vault copies" -w \
+    || { warn "the password was not saved"; return 1 }
+  print -r -- "Saved in your login Keychain as \"$KC_SERVICE\"."
+}
+
+# External drives that are plugged in: mount point <TAB> name <TAB> uuid <TAB> filesystem <TAB> free bytes
+list_usb_drives() {
+  /usr/bin/python3 - <<'PY'
+import os, plistlib, subprocess
+for name in sorted(os.listdir("/Volumes")):
+    mp = os.path.join("/Volumes", name)
+    if not os.path.ismount(mp):
+        continue
+    try:
+        info = plistlib.loads(subprocess.run(["diskutil", "info", "-plist", mp],
+                                             capture_output=True, timeout=20).stdout)
+    except Exception:
+        continue
+    if info.get("Internal", True) or info.get("BusProtocol") == "Disk Image" or not info.get("VolumeUUID"):
+        continue
+    free = info.get("FreeSpace") or info.get("APFSContainerFree") or 0
+    print("\t".join([mp, info.get("VolumeName") or name, info["VolumeUUID"],
+                     (info.get("FilesystemType") or "").lower(), str(free)]))
+PY
+}
+
+# vault usb setup            asks which plugged-in drive to use
+# vault usb setup "My Drive" uses that drive (its name or mount point) without asking
+cmd_usb_setup() {
+  local want=$1
+  local -a drives f; local i line choice ans
+  if [[ -z $want ]]; then
+    [[ -t 0 ]] || { warn "run this in Terminal: vault usb setup (or name the drive: vault usb setup \"My Drive\")"; return 1 }
+    print -r -- "Project Vault can save an encrypted copy of the vault to a USB drive whenever it is"
+    print -r -- "plugged in. It never erases or formats the drive: it only adds a folder called"
+    print -r -- "\"$USB_DIR\" and leaves everything else on the drive as it is."
+    print
+    print -r -- "Plug in the drive now, then press Return."
+    read -r "ans?"
+  fi
+  drives=( ${(f)"$(list_usb_drives)"} )
+  if (( ! ${#drives} )); then warn "no USB drive found; plug one in and run vault usb setup again"; return 1; fi
+  if [[ -n $want ]]; then
+    want="${want%/}"
+    for line in $drives; do
+      f=( "${(@ps:\t:)line}" )
+      [[ ${f[2]} == "$want" || ${f[1]} == "$want" || ${f[1]} == "/Volumes/$want" ]] && { choice=found; break }
+    done
+    [[ $choice == found ]] || { warn "no plugged-in USB drive called \"$want\"; run vault usb setup to pick from a list"; return 1 }
+  else
+    print
+    for i in {1..${#drives}}; do
+      f=( "${(@ps:\t:)drives[i]}" )
+      print -r -- "  $i) ${f[2]}  (${f[4]:-unknown format}, $(( ${f[5]:-0} / 1000000000 )) GB free)  ${f[1]}"
+    done
+    read -r "choice?Which drive? [1-${#drives}] "
+    [[ $choice == <1-> && $choice -le ${#drives} ]] || { warn "no drive chosen; nothing changed"; return 1 }
+    f=( "${(@ps:\t:)drives[choice]}" )
+  fi
+  case ${f[4]} in
+    exfat|msdos) print -r -- "${f[2]} is ${f[4]:u}: copies on it open on both Mac and Windows." ;;
+    ntfs)
+      warn "${f[2]} is an NTFS (Windows) drive, and macOS can only read NTFS, not write to it, so copies cannot be saved there. Nothing was changed; choose another drive."
+      return 1 ;;
+    *)
+      print -r -- "${f[2]} is ${f[4]:-a Mac format}: copies on it work on Macs. Windows cannot read this drive,"
+      print -r -- "so on Windows use the copies in your cloud folder (vault offsite setup) instead." ;;
+  esac
+  [[ -w ${f[1]} ]] || { warn "cannot write to ${f[1]}; nothing was changed"; return 1 }
+  ensure_password || return 1
+  offsite_set USB_UUID "${f[3]}"
+  offsite_set USB_NAME "${f[2]}"
+  rm -f "$STATE/last-usb" "$STATE/attempt-usb"
+  print -r -- "Saved. Copies go to \"$USB_DIR\" on ${f[2]} whenever it is plugged in and the vault"
+  print -r -- "changed. Nothing else on the drive is touched. Making the first copy now..."
+  make_copies "usb"$'\t'"${f[1]}/$USB_DIR"
+}
+
+cmd_usb() {
+  case ${1:-status} in
+    setup) cmd_usb_setup "$2" ;;
+    now)
+      local mp; mp=$(usb_mount) || { warn "$(usb_name) is not plugged in (or not set up: vault usb setup)"; return 1 }
+      make_copies "usb"$'\t'"$mp/$USB_DIR" ;;
+    status) cmd_offsite_status | sed -n '/^USB drive:/,$p' ;;
+    remove)
+      offsite_set USB_UUID ""; offsite_set USB_NAME ""; rm -f "$STATE/last-usb" "$STATE/attempt-usb"
+      print -r -- "The USB drive is no longer used. Copies already on it are kept." ;;
+    *) warn "usage: vault usb [setup|now|status|remove]"; return 2 ;;
+  esac
 }
 
 write_index() {
@@ -527,6 +797,8 @@ write_plist() {
   <integer>900</integer>
   <key>RunAtLoad</key>
   <true/>
+  <key>StartOnMount</key>
+  <true/>
   <key>ProcessType</key>
   <string>Background</string>
   <key>LowPriorityIO</key>
@@ -594,12 +866,24 @@ cmd_service() {
   fi
   local line
   if [[ -f "$STATE/last-sync" ]]; then line=$(<"$STATE/last-sync"); print -r -- "Last backup:      ${line[1,19]}"; fi
-  if offsite_dest >/dev/null; then
-    if [[ -f "$STATE/last-offsite" ]]; then line=$(<"$STATE/last-offsite"); print -r -- "iCloud copy:      ${line[1,19]}"
-    else print -r -- "iCloud copy:      none yet"; fi
-    [[ -f "$STATE/offsite-attempt" ]] && print -r -- "                  last try FAILED; try now with: vault offsite"
+  local d
+  if d=$(offsite_dest); then
+    if [[ -f "$STATE/last-offsite" ]]; then line=$(<"$STATE/last-offsite"); print -r -- "Cloud copy:       ${line[1,19]}  (${d:t})"
+    else print -r -- "Cloud copy:       none yet  (${d:t})"; fi
+    [[ -f "$STATE/attempt-cloud" ]] && print -r -- "                  last try FAILED; try now with: vault offsite"
   else
-    print -r -- "iCloud copy:      not set up"
+    print -r -- "Cloud copy:       not set up (vault offsite setup)"
+  fi
+  if offsite_setting USB_UUID >/dev/null; then
+    local plugged="not plugged in"; usb_mount >/dev/null && plugged="plugged in"
+    if [[ -f "$STATE/last-usb" ]]; then line=$(<"$STATE/last-usb"); print -r -- "USB copy:         ${line[1,19]}  ($(usb_name), $plugged)"
+    else print -r -- "USB copy:         none yet  ($(usb_name), $plugged)"; fi
+    if [[ -f "$STATE/last-usb" ]] && older_than "$STATE/last-usb" $(( 14 * 24 * 60 )); then
+      print -r -- "                  over two weeks old: plug in $(usb_name)"
+    fi
+    [[ -f "$STATE/attempt-usb" ]] && print -r -- "                  last try FAILED; see ~/Library/Logs/ProjectVault/agent.log"
+  else
+    print -r -- "USB copy:         not set up (vault usb setup)"
   fi
   local pid=""
   [[ -f "$STATE/ui.json" ]] && pid=$(sed -n 's/.*"pid": *\([0-9]*\).*/\1/p' "$STATE/ui.json")
@@ -614,31 +898,28 @@ cmd_offsite_setup() {
   [[ -t 0 ]] || { warn "run this in Terminal: vault offsite setup"; return 1 }
   local icloud="$HOME/Library/Mobile Documents/com~apple~CloudDocs" def="" dest=""
   [[ -d $icloud ]] && def="$icloud/ProjectVault Backups"
-  print -r -- "Project Vault can keep encrypted (AES-256) copies of the vault off this Mac."
-  print -r -- "A copy is made a day after anything changes, and at least once a week."
+  print -r -- "Project Vault can keep encrypted (AES-256) copies of the vault off this Mac, in a"
+  print -r -- "folder that syncs to the cloud. A copy is made a day after anything changes, and"
+  print -r -- "at least once a week. (For a USB drive, use: vault usb setup)"
   print
   if [[ -n $def ]]; then
     print -r -- "Where should the copies go? Press Return for iCloud Drive (ProjectVault Backups),"
-    print -r -- "or type another folder, such as a Google Drive or Dropbox folder, or a USB drive."
+    print -r -- "or type another folder, such as a Google Drive or Dropbox folder."
   else
     print -r -- "Where should the copies go? Type a folder that syncs off this Mac, such as a"
-    print -r -- "Google Drive or Dropbox folder, or a folder on a USB drive."
+    print -r -- "Google Drive or Dropbox folder."
   fi
   read -r "dest?Folder: "
   dest="${dest:-$def}"; dest="${dest/#\~/$HOME}"; dest="${dest%/}"
   [[ -n $dest ]] || { warn "no folder given; nothing changed"; return 1 }
   mkdir -p "$dest" 2>/dev/null
   [[ -d $dest && -w $dest ]] || { warn "cannot write to $dest; nothing changed"; return 1 }
-  print
-  print -r -- "Now choose the backup password. Save it in your password manager FIRST:"
-  print -r -- "without it, nobody can open the copies, not even you. You will type it twice."
-  security add-generic-password -U -a "$USER" -s "$KC_SERVICE" -l "$KC_SERVICE" \
-    -j "Password for the encrypted Project Vault copies" -w \
-    || { warn "the password was not saved; nothing changed"; return 1 }
-  { print -r -- "DEST=${dest/#$HOME/~}"; print -r -- "KEEP=12"; } > "$OFFSITE_CONF"
-  print -r -- "Saved: the password is in your login Keychain as \"$KC_SERVICE\"."
-  print -r -- "Making the first copy now..."
-  cmd_offsite_now
+  ensure_password || return 1
+  offsite_set DEST "${dest/#$HOME/~}"
+  offsite_setting KEEP >/dev/null || offsite_set KEEP 12
+  rm -f "$STATE/last-offsite" "$STATE/attempt-cloud"
+  print -r -- "Saved. Making the first copy now..."
+  make_copies "cloud"$'\t'"$dest"
 }
 
 usage() {
@@ -657,9 +938,11 @@ Vault folder:    $VAULT
   vault open                  open the vault in Finder
   vault ui                    open the Project Vault window in your browser
 
-  vault offsite setup         choose where encrypted copies go and set their password
-  vault offsite               make an encrypted copy now (also automatic)
-  vault offsite status        where copies go, and when the last one was made
+  vault offsite setup         keep encrypted copies in iCloud Drive or another cloud folder
+  vault usb setup             keep encrypted copies on a USB drive whenever it is plugged in
+  vault offsite               make encrypted copies now, everywhere set up (also automatic)
+  vault offsite status        where copies go, and when the last ones were made
+  vault usb [now|status|remove]  copy to the USB drive now / show it / stop using it
 
   vault service               is the background sync on? last backup, last copy, window
   vault stop                  turn the background sync off (stays off after a restart)
@@ -685,9 +968,9 @@ take_lock() {
       # No owner written yet: only stale if it is more than a minute old.
       [[ -z $(find "$LOCK" -maxdepth 0 -mmin +1 2>/dev/null) ]] && held=1
     fi
-    if (( held )); then warn "another sync is running; try again in a minute"; return 1; fi
+    if (( held )); then (( QUIET )) || warn "another sync is running; try again in a minute"; return 1; fi
     rm -rf "$LOCK"
-    mkdir "$LOCK" 2>/dev/null || { warn "another sync is running; try again in a minute"; return 1 }
+    mkdir "$LOCK" 2>/dev/null || { (( QUIET )) || warn "another sync is running; try again in a minute"; return 1 }
   fi
   print -r -- $$ > "$LOCK/pid"
 }
@@ -713,6 +996,13 @@ case ${1:-help} in
       *) warn "usage: vault offsite [now|status|setup]"; exit 2 ;;
     esac ;;
   status)  cmd_status ;;
+  usb)
+    shift
+    if [[ ${1:-status} == (setup|now) ]]; then
+      take_lock || exit 1
+      trap 'rm -rf "$LOCK"' EXIT
+    fi
+    cmd_usb "$@" ;;
   service) cmd_service ;;
   start)   cmd_start ;;
   stop)    cmd_stop ;;

@@ -265,26 +265,46 @@ def agent_status():
             "lastExit": m.group(1).strip() if m else None}
 
 
+def _last_copy(name):
+    try:
+        with open(os.path.join(STATE, name), encoding="utf-8") as f:
+            line = f.read().strip()
+        return {"at": line[:19], "name": (line[19:].split() or [""])[0]}
+    except OSError:
+        return None
+
+
+def _usb_plugged(uuid):
+    try:
+        out = subprocess.run(["diskutil", "info", "-plist", uuid], capture_output=True, timeout=10).stdout
+        import plistlib
+        mp = plistlib.loads(out).get("MountPoint") if out else None
+        return bool(mp and os.path.isdir(mp))
+    except Exception:
+        return False
+
+
 def offsite_status():
     conf = os.path.join(VAULT, "offsite.conf")
-    dest = None
+    settings = {}
     if os.path.exists(conf):
         with open(conf, encoding="utf-8", errors="replace") as f:
             for line in f:
-                if line.startswith("DEST="):
-                    dest = line[5:].strip()
-    if not dest:
-        return {"configured": False}
-    last = None
-    try:
-        with open(os.path.join(STATE, "last-offsite"), encoding="utf-8") as f:
-            line = f.read().strip()
-        last = {"at": line[:19], "name": (line[19:].split() or [""])[0]}
-    except OSError:
-        pass
-    where = "iCloud Drive" if "com~apple~CloudDocs" in dest else dest
-    return {"configured": True, "where": where, "last": last,
-            "failing": os.path.exists(os.path.join(STATE, "offsite-attempt"))}
+                if "=" in line:
+                    k, v = line.rstrip("\n").split("=", 1)
+                    settings[k] = v
+    dest = settings.get("DEST", "").strip()
+    out = {"configured": bool(dest), "usb": {"configured": bool(settings.get("USB_UUID"))}}
+    if dest:
+        out.update({"where": "iCloud Drive" if "com~apple~CloudDocs" in dest else dest,
+                    "last": _last_copy("last-offsite"),
+                    "failing": os.path.exists(os.path.join(STATE, "attempt-cloud"))})
+    if settings.get("USB_UUID"):
+        out["usb"].update({"name": settings.get("USB_NAME") or "USB drive",
+                           "plugged": _usb_plugged(settings["USB_UUID"]),
+                           "last": _last_copy("last-usb"),
+                           "failing": os.path.exists(os.path.join(STATE, "attempt-usb"))})
+    return out
 
 
 def extras_entries():

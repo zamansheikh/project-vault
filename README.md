@@ -7,8 +7,9 @@
 **Never lose a `.env` file or an Android keystore again.**
 
 Project Vault backs up the files your projects need but git ignores (`.env` files,
-Firebase configs, keystores, signing keys). It keeps every version of them and an
-encrypted copy off your Mac, and it does all of this without you having to think about it.
+Firebase configs, keystores, signing keys). It keeps every version of them, plus
+encrypted copies in the cloud and on a USB drive that you can open even from
+Windows, and it does all of this without you having to think about it.
 
 [![Platform: macOS](https://img.shields.io/badge/platform-macOS-000000?logo=apple&logoColor=white)](#install)
 [![zsh](https://img.shields.io/badge/zsh-script-4EAA25?logo=gnubash&logoColor=white)](src/vault)
@@ -53,8 +54,11 @@ and puts an encrypted copy somewhere safe. It changes nothing in your repos.
 - **Keeps your folder layout.** `current/` mirrors your projects folder, so you
   always know where a file belongs.
 - **Runs on its own.** A low-priority background job runs every 15 minutes and at login.
-- **Encrypted copies off your Mac.** It saves AES-256 `.dmg` copies to iCloud
-  Drive or any folder you choose, and opens each copy to check it before keeping it.
+- **Encrypted copies off your Mac.** It saves AES-256 copies to iCloud Drive
+  (or any cloud folder) and to a USB drive whenever it is plugged in. It opens
+  each copy to check it before keeping it.
+- **Recoverable without a Mac.** Every copy is saved as a `.dmg` for Macs *and*
+  as a `.tar.gz.enc` that opens on Windows (one PowerShell command) and Linux.
 - **Comes with a window.** You can browse, compare, download, restore and add
   files there. It runs only on your Mac, and values stay hidden until you ask to see them.
 - **Restores with one command.** `vault restore acme/shop-app` puts every file
@@ -68,8 +72,9 @@ and puts an encrypted copy somewhere safe. It changes nothing in your repos.
 flowchart LR
     P["Your projects<br/>~/Documents/…"] -- "every 15 minutes<br/>only files git ignores" --> C["_ProjectVault/current<br/>latest copy, same paths"]
     C -- "when a file changes" --> H["_ProjectVault/history<br/>.env.v1, .env.v2, …"]
-    C -- "a day after a change,<br/>at least weekly" --> D["ProjectVault-‹date›.dmg<br/>AES-256, checked"]
-    D --> I["iCloud Drive<br/>or any folder you choose"]
+    C -- "a day after a change,<br/>at least weekly" --> D["Encrypted copy, checked<br/>.dmg (Mac) + .tar.gz.enc (Windows, Linux)"]
+    D --> I["iCloud Drive<br/>or any cloud folder"]
+    D -- "whenever it is plugged in<br/>and something changed" --> U["USB drive<br/>(ExFAT: Mac and Windows)"]
 ```
 
 What a file's history looks like:
@@ -109,10 +114,11 @@ The installer:
 | The **Project Vault** app, which opens the window | `~/Applications/Project Vault.app` |
 | Your vault | `<projects folder>/_ProjectVault` |
 
-It also runs the first backup. To keep encrypted copies off your Mac (recommended), run:
+It also runs the first backup. Then set up encrypted copies off your Mac (recommended):
 
 ```bash
-vault offsite setup
+vault offsite setup   # iCloud Drive, or a Google Drive / Dropbox folder
+vault usb setup       # a USB drive, copied whenever it is plugged in
 ```
 
 To update, run `git pull && ./install.sh` again. Your vault, its history and
@@ -178,8 +184,10 @@ in your browser, but it is served only from your own Mac.
 | `vault history <path>` | List a file's versions, or a project's files |
 | `vault diff <file> [A] [B]` | Show what changed between two versions |
 | `vault ui` | Open the window |
-| `vault offsite setup` | Choose where encrypted copies go and set their password |
-| `vault offsite` / `vault offsite status` | Make an encrypted copy now / show where and when |
+| `vault offsite setup` | Keep encrypted copies in iCloud Drive or another cloud folder |
+| `vault usb setup` | Keep encrypted copies on a USB drive whenever it is plugged in |
+| `vault offsite` / `vault offsite status` | Make encrypted copies now, everywhere set up / show where and when |
+| `vault usb now` / `vault usb remove` | Copy to the USB drive now / stop using it (its copies are kept) |
 | `vault service` | Is the background job on? When did the last backup and copy run? |
 | `vault stop` / `vault start` | Turn the background job off (it stays off after a restart) / on |
 | `vault help` | Every command |
@@ -190,23 +198,83 @@ in your browser, but it is served only from your own Mac.
 
 ## Encrypted copies off your Mac
 
+Set up either or both:
+
 ```bash
-vault offsite setup
+vault offsite setup   # a cloud folder: press Return for iCloud Drive → ProjectVault Backups
+vault usb setup       # a USB drive: plug it in, pick it from the list
 ```
 
-It asks two things:
+The first one you set up asks for **a password**. You type it in Terminal (twice)
+and it is stored in your login Keychain as **Project Vault backup**, so the
+background job can use it. It is never written to a file or passed on a command
+line. **Save it in your password manager too:** without it, nobody can open the
+copies, including you. Use standard keyboard characters so it also works on Windows.
 
-1. **Where the copies go.** Press Return for **iCloud Drive → ProjectVault Backups**,
-   or type any folder: a Google Drive or Dropbox folder, or a USB drive.
-2. **A password.** You type it in Terminal (twice) and it is stored in your login
-   Keychain as **Project Vault backup**, so the background job can use it. It is
-   never written to a file or passed on a command line. **Save it in your password
-   manager too:** without it, nobody can open the copies, including you.
+| | Cloud folder | USB drive |
+|---|---|---|
+| **When a copy is made** | a day after anything in the vault changes, and at least weekly | as soon as it is plugged in, if anything changed since its last copy, and at least weekly |
+| **Where** | `ProjectVault Backups` in the folder you chose | `ProjectVault Backups` on the drive |
+| **Reminders** | the window and `vault service` show when a try failed | they also say when the USB copy is over two weeks old |
 
-After that, the background job makes a copy a day after anything in the vault
-changes, and at least once a week. Each copy is a complete, AES-256 encrypted
-`.dmg` of the vault, including its history. Before a copy is kept, it is opened
-with the password and compared file by file. The newest 12 copies are kept.
+Every copy is the whole vault, including its history, saved in two formats with
+the same password:
+
+| File | Opens on | How |
+|---|---|---|
+| `ProjectVault-<date>.dmg` | macOS | double-click, type the password |
+| `ProjectVault-<date>.tar.gz.enc` | Windows, Linux, macOS | [`tools/restore-windows.ps1`](tools/restore-windows.ps1), or `openssl` + `tar` |
+
+Before a copy is kept, **both** files are opened with the password and compared
+file by file. The newest 12 of each are kept (`KEEP=` in `offsite.conf`). A
+`README-RESTORE.txt` next to them explains how to open them without Project Vault.
+
+> **Your drive is never erased or formatted.** Project Vault only adds a
+> `ProjectVault Backups` folder and leaves everything else on the drive alone, so
+> you can use the drive you already carry. Drives formatted **ExFAT** or **FAT32**
+> (the usual format for USB sticks and external SSDs) open on both Mac and Windows.
+> Mac-format drives (APFS, Mac OS Extended) work too, but Windows can't read them.
+> NTFS drives can't be used, because macOS cannot write to them.
+>
+> You can also name the drive instead of picking it from a list:
+> `vault usb setup "My Drive"`.
+
+## If your Mac is gone (Windows or Linux)
+
+You need the backup password (from your password manager) and the newest
+`ProjectVault-<date>.tar.gz.enc`. Get it from:
+- **the USB drive** (plug it into the PC), or
+- **iCloud Drive**: [iCloud for Windows](https://apps.microsoft.com/detail/9pktq5699m62)
+  or [icloud.com/iclouddrive](https://www.icloud.com/iclouddrive) in a browser.
+
+**On Windows 10 or 11**, install [Git for Windows](https://git-scm.com/download/win)
+(it includes OpenSSL), download [`tools/restore-windows.ps1`](tools/restore-windows.ps1),
+and in PowerShell:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File restore-windows.ps1 "D:\ProjectVault Backups\ProjectVault-2026-11-23_140400.tar.gz.enc"
+```
+
+It asks for the password and unpacks into `%USERPROFILE%\ProjectVault-restore`.
+Every file is in `_ProjectVault\current`, at the same path it had on the Mac.
+Clone your projects on Windows, then add `-ProjectsFolder` and every `.env`,
+keystore and config goes back into place:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File restore-windows.ps1 "…\ProjectVault-….tar.gz.enc" -ProjectsFolder C:\code
+```
+
+Files that already exist are left alone unless you add `-Overwrite`.
+
+**On Linux, or in Git Bash on Windows:**
+
+```bash
+openssl enc -d -aes-256-cbc -pbkdf2 -iter 600000 -md sha256 -in ProjectVault-<date>.tar.gz.enc | tar -xzf -
+```
+
+> Project Vault itself runs on macOS only. On Windows you can always get every
+> file back and keep working; the automatic backups resume when you install
+> Project Vault on a Mac again.
 
 ## Getting files back
 
@@ -225,11 +293,12 @@ vault restore acme/shop-backend/.env --version 2
 ```
 
 **Your Mac is lost, or you have a new one.** Open the newest
-`ProjectVault-<date>.dmg` from iCloud Drive (or wherever your copies go) and type
-the password. Copy the `_ProjectVault` folder inside it into your projects
-folder, install Project Vault, clone your projects, and run `vault restore` for
-each one. You can also copy single files straight out of `current/`; each copy
-contains a `HOW TO RESTORE.txt` with these steps.
+`ProjectVault-<date>.dmg` from iCloud Drive or the USB drive and type the
+password. Copy the `_ProjectVault` folder inside it into your projects folder,
+install Project Vault, clone your projects, and run `vault restore` for each
+one. You can also copy single files straight out of `current/`; each copy
+contains a `HOW TO RESTORE.txt` with these steps. No Mac at all? See
+[If your Mac is gone](#if-your-mac-is-gone-windows-or-linux).
 
 `restore` never overwrites a file silently. If the project has a different
 copy, it asks first. With `--force`, or when you answer yes, your current
@@ -241,30 +310,35 @@ file is first saved in `history/` as `<name>.pre-restore_<date>`.
 |---|---|
 | A deleted, broken or re-cloned project | Someone who can log in to your Mac as you |
 | An overwritten or wrong `.env` (every version is kept) | Secrets you never put in a file it watches |
-| A lost, stolen or dead Mac, once encrypted copies are set up | Losing the backup password **and** your Mac |
+| A lost, stolen or dead Mac, once encrypted copies are set up (recoverable on Windows too) | Losing the backup password **and** your Mac |
 
 - **The vault folder** can only be opened by your macOS user (`700`). It is
   not encrypted on its own, so turn on **FileVault** (System Settings → Privacy &
   Security). Never put the vault inside a git repo; this repo's `.gitignore`
   blocks `_ProjectVault/`.
-- **Encrypted copies** use macOS's own AES-256 disk image encryption. The
-  password lives only in your login Keychain and in your password manager.
+- **Encrypted copies** are made twice: macOS's own AES-256 disk image encryption
+  (`.dmg`), and AES-256-CBC with a PBKDF2-SHA256 key (600,000 iterations) via
+  OpenSSL (`.tar.gz.enc`). The password lives only in your login Keychain and in
+  your password manager.
 - **The window** listens on `127.0.0.1` only, behind a random key created each time it
   opens. It uses an `HttpOnly`, `SameSite=Strict` cookie, checks the `Host` header,
   requires a custom header on every change, and loads nothing from the internet.
   It stops after 15 idle minutes.
-- **Nothing leaves your Mac** except the encrypted `.dmg`, and only if you run
-  `vault offsite setup`, only to the folder you choose.
+- **Nothing leaves your Mac** except the encrypted copies, and only if you run
+  `vault offsite setup` or `vault usb setup`, only to the folder or drive you choose.
 - **Spotlight** indexes the vault by default. To keep secrets out of search
   results, add the vault folder under System Settings → Spotlight → Search Privacy.
 
 ## Background job
 
 ```bash
-vault service   # on or off, last backup, last encrypted copy, window open or closed
+vault service   # on or off, last backup, last cloud and USB copy, window open or closed
 vault stop      # off, and stays off after a restart
 vault start     # on again
 ```
+
+It runs every 15 minutes, at login, and whenever a drive is plugged in (so a USB
+copy starts right away).
 
 Its log is `~/Library/Logs/ProjectVault/agent.log`. If the log ever says
 `cannot read` or `could not write`, macOS blocked the job from a protected
@@ -278,7 +352,7 @@ folder. Add `~/Library/Application Support/ProjectVault/ProjectVaultAgent` under
 | `~/Library/Application Support/ProjectVault/config` | `ROOT` (your projects folder) and `VAULT` (the vault folder). Change them by running `./install.sh --root …` again. |
 | `<vault>/extras.txt` | Extra files or folders to back up, one per line, relative to `ROOT` |
 | `<vault>/exclude.txt` | Paths never to back up (for example third-party code that ships `.env` files) |
-| `<vault>/offsite.conf` | `DEST=` (where encrypted copies go) and `KEEP=` (how many to keep; default 12) |
+| `<vault>/offsite.conf` | `DEST=` (the cloud folder), `USB_UUID=` and `USB_NAME=` (the USB drive), `KEEP=` (copies to keep in each place; default 12) |
 | Keychain item **Project Vault backup** | The encrypted copies' password |
 
 ## Uninstall
@@ -305,9 +379,8 @@ You can use both.
 <details>
 <summary><b>Does it upload anything?</b></summary>
 
-No. The only thing that ever leaves the vault folder is the encrypted `.dmg`,
-written to the folder you choose in `vault offsite setup`. The window talks only
-to your own Mac.
+No. The only things that ever leave the vault folder are the encrypted copies,
+written to the folder or USB drive you chose. The window talks only to your own Mac.
 </details>
 
 <details>
@@ -328,9 +401,11 @@ for anything else you don't want scanned.
 <details>
 <summary><b>Linux or Windows?</b></summary>
 
-Not yet. Project Vault uses launchd, the macOS Keychain and `hdiutil`. A port
-would need a different scheduler, secret store and encryption; contributions
-are welcome.
+You can **recover** everything on Windows or Linux: see
+[If your Mac is gone](#if-your-mac-is-gone-windows-or-linux). The backup tool
+itself runs on macOS only, because it uses launchd, the macOS Keychain and
+`hdiutil`. A Windows version would need Task Scheduler and the Windows
+Credential Manager instead; contributions are welcome.
 </details>
 
 ## Development
@@ -339,10 +414,12 @@ are welcome.
 zsh tests/smoke.sh
 ```
 
-This runs `src/vault` against a throwaway folder and checks 26 things: what is
-picked up and skipped, versions, missing sources, restores, lock recovery, and
-an encrypted copy that must refuse a wrong password. It never touches your real
-vault, background job or login Keychain.
+This runs `src/vault` against a throwaway folder and checks 39 things: what is
+picked up and skipped, versions, missing sources, restores, lock recovery, both
+encrypted formats (they must refuse a wrong password, and the `.tar.gz.enc` must
+open with OpenSSL 3, as shipped with Git for Windows, using the same command as
+the Windows script), and USB copies on an ExFAT disk image standing in for a
+drive. It never touches your real vault, background job or login Keychain.
 
 | Path | What it is |
 |---|---|
@@ -350,6 +427,7 @@ vault, background job or login Keychain.
 | `src/vault_ui.py`, `src/vault_ui.html` | The window's local server and page |
 | `src/ProjectVaultAgent.c` | The small program launchd starts, so macOS permissions can go to it instead of `/bin/zsh` |
 | `install.sh`, `uninstall.sh` | Install, update and remove |
+| `tools/restore-windows.ps1` | Opens a `.tar.gz.enc` copy on Windows and puts files back into your projects |
 | `assets/` | The app icon and the script that draws it |
 
 ## License
